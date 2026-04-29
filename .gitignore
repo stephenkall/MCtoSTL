@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+mc_output/
+*.stl
+*.png
