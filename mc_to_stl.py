@@ -120,7 +120,7 @@ def collect_params(saved: Dict = None) -> Dict:
     print(f"  After the first run, results are cached — subsequent runs are instant.")
     n_workers = _ask_int(
         f"Parallel workers for chunk loading",
-        default=d("n_workers", _cpu),
+        d("n_workers", _cpu),
         mn=1,
     )
 
