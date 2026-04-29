@@ -9,7 +9,7 @@ from typing import Dict, Tuple
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from .anvil import parse_region
+from .anvil import parse_region, diagnose_region
 
 
 def find_region_dir(save_path: str) -> str:
@@ -28,7 +28,22 @@ def find_region_dir(save_path: str) -> str:
     )
 
 
-def load_save(save_path: str) -> Tuple[np.ndarray, Dict]:
+def diagnose_save(save_path: str, n_regions: int = 2, chunks_per_region: int = 3) -> None:
+    """
+    Print diagnostic information about the first few region files to help
+    identify which Minecraft format / version the save uses.
+    """
+    import glob
+    region_path = find_region_dir(save_path)
+    files = sorted(glob.glob(os.path.join(region_path, "r.*.*.mca")))[:n_regions]
+    if not files:
+        print("  No .mca files found.")
+        return
+    for fp in files:
+        diagnose_region(fp, max_chunks=chunks_per_region)
+
+
+def load_save(save_path: str, debug: bool = False) -> Tuple[np.ndarray, Dict]:
     """
     Load all region files from a Minecraft save.
 
@@ -57,7 +72,7 @@ def load_save(save_path: str) -> Tuple[np.ndarray, Dict]:
             end="",
             flush=True,
         )
-        all_chunks.update(parse_region(fp))
+        all_chunks.update(parse_region(fp, debug=debug))
 
     print(f"\n  Loaded {len(all_chunks)} chunk(s) with heightmap data.")
 
