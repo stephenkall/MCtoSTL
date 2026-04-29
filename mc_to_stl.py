@@ -112,6 +112,18 @@ def collect_params(saved: Dict = None) -> Dict:
     _sec("Output")
     out_dir = _ask_path("Output directory", default=d("out_dir", "mc_output"))
 
+    _sec("Performance")
+    import multiprocessing as _mp
+    _cpu = _mp.cpu_count()
+    print(f"  System has {_cpu} CPU core(s).")
+    print(f"  Each worker parses one .mca region file in parallel.")
+    print(f"  After the first run, results are cached — subsequent runs are instant.")
+    n_workers = _ask_int(
+        f"Parallel workers for chunk loading",
+        default=d("n_workers", _cpu),
+        mn=1,
+    )
+
     _sec("Block Filtering")
     print("  ground_only = YES  →  ignore trees, plants, man-made structures")
     print("                        (uses MOTION_BLOCKING_NO_LEAVES or scans sections)")
@@ -172,6 +184,7 @@ def collect_params(saved: Dict = None) -> Dict:
 
     return dict(
         save_path=save_path, out_dir=out_dir,
+        n_workers=n_workers,
         ground_only=ground_only,
         smooth_sigma=smooth_sigma,
         mask_ocean=mask_ocean,
@@ -207,6 +220,7 @@ def stage_load(cp: Checkpoint, params: Dict):
             out_dir=params["out_dir"],
             ground_only=params["ground_only"],
             use_cache=True,
+            n_workers=params.get("n_workers", 0),
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"\n  ✗  {exc}")
