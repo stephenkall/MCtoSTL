@@ -18,6 +18,7 @@ Flags:
 
 import os
 import sys
+import time
 from datetime import datetime
 from typing import Any, Dict
 
@@ -257,24 +258,30 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         cp.set_params(params)
 
     print(f"  Sea level: Y={sea_level}")
-    print(f"  Building ocean mask …", end=" ", flush=True)
+    print(f"  Map size : {hm_raw.shape[1]:,} × {hm_raw.shape[0]:,} blocks "
+          f"({hm_raw.size:,} total)")
+
+    print(f"\n  [Ocean mask]")
+    t0 = time.perf_counter()
     ocean_mask = build_ocean_mask(
         hm_raw,
         sea_level=sea_level,
         min_ocean_blocks=params["min_ocean_blocks"],
     )
     pct = 100.0 * ocean_mask.sum() / ocean_mask.size
-    print(f"done  ({pct:.1f}% ocean)")
+    print(f"    → {pct:.1f}% ocean  ({time.perf_counter()-t0:.1f}s total)")
 
     if params["min_land_area"] > 0:
-        before = ocean_mask.sum()
+        print(f"\n  [Micro-island filter]")
+        t1 = time.perf_counter()
+        before = int(ocean_mask.sum())
         ocean_mask = remove_micro_islands(
             hm_raw, ocean_mask,
             sea_level=sea_level,
             min_land_area=params["min_land_area"],
         )
-        removed = int(ocean_mask.sum() - before)
-        print(f"  Removed {removed:,} micro-island block(s) as noise.")
+        removed = int(ocean_mask.sum()) - before
+        print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
 
     hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=sea_level)
     cp.save_work_heightmap(hm_work, ocean_mask)
