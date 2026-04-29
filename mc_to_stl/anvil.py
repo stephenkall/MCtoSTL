@@ -93,43 +93,114 @@ def _unpack_longs(longs, bits: int, count: int) -> list:
 
 _AIR = frozenset({"minecraft:air", "minecraft:cave_air", "minecraft:void_air"})
 
+# Blocks to skip in ground-only mode (plants, wood, decorative, man-made).
+# Matched as substrings of the bare block name (after stripping "namespace:").
+# Unknown / modded blocks are treated as solid ground (conservative fallback).
+_NON_TERRAIN_SUBSTRINGS = (
+    # Leaves / foliage
+    "_leaves", "azalea_leaves",
+    # Logs / wood (above-ground trunks)
+    "_log", "_wood", "stripped_",
+    # Man-made wood
+    "_planks", "_slab", "_stairs", "_fence", "_gate", "_wall",
+    "_door", "_trapdoor", "_button", "_pressure_plate",
+    # Glass
+    "glass",
+    # Plants standing on ground
+    "grass",        # tall_grass, grass (short) — NOT grass_block
+    "fern", "large_fern",
+    "dead_bush", "bush",
+    "bamboo", "sugarcane", "cactus",
+    "kelp", "seagrass", "coral",
+    "vine", "hanging_roots", "spore_blossom",
+    "azalea",       # azalea itself (not azalea_leaves, matched above)
+    "dripleaf", "glow_lichen", "moss_carpet",
+    # Flowers
+    "dandelion", "poppy", "orchid", "allium", "bluet",
+    "tulip", "daisy", "cornflower", "lily_of", "sunflower",
+    "lilac", "rose_bush", "peony", "wither_rose",
+    "pitcher", "torchflower",
+    # Mushrooms on ground
+    "brown_mushroom", "red_mushroom",
+    "crimson_fungus", "warped_fungus",
+    "crimson_roots", "warped_roots", "nether_sprouts",
+    # Decorative / structural
+    "torch", "lantern", "chain", "bars",
+    "carpet", "banner", "sign", "bed",
+    "flower_pot", "skull", "head",
+    "lever", "rail", "ladder",
+    "cobweb", "string",
+    "chest", "barrel", "barrel",
+    "bookshelf", "scaffolding",
+    "sapling",
+)
+
+# Exceptions: names containing a substring from above but that ARE terrain
+_NON_TERRAIN_EXCEPTIONS = frozenset({
+    "minecraft:grass_block",
+    "minecraft:mycelium",       # contains no substring but keep safe
+    "minecraft:podzol",
+    "minecraft:dirt_path",
+    "minecraft:farmland",
+})
+
+
+def _is_non_terrain(name: str) -> bool:
+    """Return True if this block should be skipped in ground-only scanning."""
+    if name in _AIR:
+        return True
+    if name in _NON_TERRAIN_EXCEPTIONS:
+        return False
+    bare = name.split(":")[-1]
+    return any(sub in bare for sub in _NON_TERRAIN_SUBSTRINGS)
+
 
 def _is_air(palette_entry) -> bool:
     name = str(palette_entry.get("Name", "")) if hasattr(palette_entry, "get") else str(palette_entry)
     return name in _AIR
 
 
-def _decode_section_to_air_mask(section) -> Optional[np.ndarray]:
+def _get_block_name(palette_entry) -> str:
+    return str(palette_entry.get("Name", "")) if hasattr(palette_entry, "get") else str(palette_entry)
+
+
+def _decode_section(
+    section, ground_only: bool = False
+) -> Optional[np.ndarray]:
     """
-    Decode one 16×16×16 chunk section into a boolean array (True = air).
+    Decode one 16×16×16 chunk section into a boolean "skip" mask
+    (True = skip this block when scanning downward).
+
+    ground_only=False: skip only air
+    ground_only=True:  skip air + plants + wood + structures
     Shape: (16, 16, 16) in (local_y, z, x) order.
-    Returns None if the section cannot be decoded.
     """
+    skip_fn = _is_non_terrain if ground_only else _is_air
+
     # ── 1.18+ ────────────────────────────────────────────────────────────
     if "block_states" in section:
         bs = section["block_states"]
         palette = list(bs.get("palette", []))
         if not palette:
             return None
-        air_flags = [_is_air(p) for p in palette]
+        skip_flags = [skip_fn(_get_block_name(p)) for p in palette]
         if "data" not in bs:
-            # Single-entry palette (all same block)
-            val = air_flags[0]
+            val = skip_flags[0]
             return np.full((16, 16, 16), val, dtype=bool)
         longs = list(bs["data"])
         bits = max(4, math.ceil(math.log2(max(len(palette), 2))))
         vals = _unpack_longs(longs, bits, 4096)
-        mask = np.array([air_flags[v] for v in vals], dtype=bool)
+        mask = np.array([skip_flags[v] for v in vals], dtype=bool)
         return mask.reshape(16, 16, 16)
 
     # ── 1.13–1.17 ────────────────────────────────────────────────────────
     if "BlockStates" in section and "Palette" in section:
         palette = list(section["Palette"])
-        air_flags = [_is_air(p) for p in palette]
+        skip_flags = [skip_fn(_get_block_name(p)) for p in palette]
         longs = list(section["BlockStates"])
         bits = max(4, math.ceil(math.log2(max(len(palette), 2))))
         vals = _unpack_longs(longs, bits, 4096)
-        mask = np.array([air_flags[v] for v in vals], dtype=bool)
+        mask = np.array([skip_flags[v] for v in vals], dtype=bool)
         return mask.reshape(16, 16, 16)
 
     # ── Pre-1.13 ─────────────────────────────────────────────────────────
@@ -137,12 +208,15 @@ def _decode_section_to_air_mask(section) -> Optional[np.ndarray]:
         raw = bytes(section["Blocks"])
         if len(raw) == 4096:
             arr = np.frombuffer(raw, dtype=np.uint8).reshape(16, 16, 16)
-            return arr == 0  # block id 0 = air
+            return arr == 0  # pre-1.13: only block id 0 is air
+
 
     return None
 
 
-def _heightmap_from_sections(chunk) -> Optional[np.ndarray]:
+def _heightmap_from_sections(
+    chunk, ground_only: bool = False
+) -> Optional[np.ndarray]:
     """
     Compute a 16×16 surface heightmap by scanning block sections from top to
     bottom and finding the highest non-air block in each column.
@@ -175,13 +249,13 @@ def _heightmap_from_sections(chunk) -> Optional[np.ndarray]:
         if sec is None:
             continue
         try:
-            air = _decode_section_to_air_mask(sec)
+            skip = _decode_section(sec, ground_only=ground_only)
         except Exception:
             continue
-        if air is None:
+        if skip is None:
             continue
         for ly in range(15, -1, -1):
-            solid = ~air[ly]             # shape (16, 16) = (z, x)
+            solid = ~skip[ly]            # shape (16, 16) = (z, x)
             mask = solid & ~found
             if mask.any():
                 heightmap[mask] = sy * 16 + ly + 1
@@ -192,26 +266,38 @@ def _heightmap_from_sections(chunk) -> Optional[np.ndarray]:
 
 # ── Per-chunk heightmap extraction ───────────────────────────────────────────
 
-_HM_KEYS = (
+# Heightmap key preference by mode
+_HM_KEYS_SURFACE = (
     "WORLD_SURFACE",
     "MOTION_BLOCKING",
     "WORLD_SURFACE_WG",
     "MOTION_BLOCKING_NO_LEAVES",
 )
+_HM_KEYS_GROUND = (
+    # MOTION_BLOCKING_NO_LEAVES ignores leaves, keeps water → shows rivers
+    "MOTION_BLOCKING_NO_LEAVES",
+    "MOTION_BLOCKING",
+    "WORLD_SURFACE",
+)
 
 
-def _extract_heightmap(root: nbtlib.Compound) -> Optional[np.ndarray]:
+def _extract_heightmap(
+    root: nbtlib.Compound, ground_only: bool = False
+) -> Optional[np.ndarray]:
     """
-    Extract a 16×16 int32 heightmap array from a parsed chunk Compound.
-    Tries three approaches in order of preference.
+    Extract a 16×16 int32 heightmap from a parsed chunk Compound.
+
+    ground_only=False: standard WORLD_SURFACE (includes trees, structures)
+    ground_only=True:  prefers MOTION_BLOCKING_NO_LEAVES; section fallback
+                       skips plants, wood, and decorative blocks
     """
-    # Pre-1.18 wraps everything under 'Level'
     chunk = root.get("Level", root)
+    hm_keys = _HM_KEYS_GROUND if ground_only else _HM_KEYS_SURFACE
 
     # 1 ── New format: Heightmaps compound (1.13+) ────────────────────────
     if "Heightmaps" in chunk:
         hm_c = chunk["Heightmaps"]
-        for key in _HM_KEYS:
+        for key in hm_keys:
             if key not in hm_c:
                 continue
             longs = list(hm_c[key])
@@ -228,7 +314,7 @@ def _extract_heightmap(root: nbtlib.Compound) -> Optional[np.ndarray]:
             return np.array([int(v) for v in hm[:256]], dtype=np.int32).reshape(16, 16)
 
     # 3 ── Fallback: compute from block sections ───────────────────────────
-    return _heightmap_from_sections(chunk)
+    return _heightmap_from_sections(chunk, ground_only=ground_only)
 
 
 # ── Region file parsing ──────────────────────────────────────────────────────
@@ -236,6 +322,7 @@ def _extract_heightmap(root: nbtlib.Compound) -> Optional[np.ndarray]:
 def parse_region(
     filepath: str,
     debug: bool = False,
+    ground_only: bool = False,
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """
     Parse a single .mca file.
@@ -296,7 +383,7 @@ def parse_region(
                     print(f"    [chunk {i}] NBT parse returned None")
                 continue
 
-            hm = _extract_heightmap(root)
+            hm = _extract_heightmap(root, ground_only=ground_only)
             if hm is None:
                 if debug:
                     chunk = root.get("Level", root)
@@ -377,7 +464,8 @@ def diagnose_region(filepath: str, max_chunks: int = 3) -> None:
 
             hm_keys = list(chunk["Heightmaps"].keys()) if has_hm_new else []
 
-            hm = _extract_heightmap(root)
+            hm = _extract_heightmap(root, ground_only=False)
+            hm_g = _extract_heightmap(root, ground_only=True)
 
             print(f"  Chunk {i}: DataVersion={dv}  Status={status!r}")
             print(f"    Keys           : {keys[:12]}")
@@ -385,6 +473,7 @@ def diagnose_region(filepath: str, max_chunks: int = 3) -> None:
             print(f"    HeightMap(old) : {has_hm_old}")
             print(f"    Has sections   : {has_sections}")
             print(f"    Extracted HM   : {'OK  min=%d max=%d' % (hm.min(), hm.max()) if hm is not None else 'FAILED'}")
+            print(f"    Ground-only HM : {'OK  min=%d max=%d' % (hm_g.min(), hm_g.max()) if hm_g is not None else 'FAILED (will use WORLD_SURFACE)'}")
             found += 1
 
         except Exception as exc:

@@ -1,71 +1,66 @@
 """
-Ocean detection and masking.
+Ocean detection, masking, and micro-island removal.
 
 Strategy
 --------
-1. Auto-detect sea level: the most common height value in the lower half of
-   the height distribution.  For Minecraft worlds, the water surface is a
-   flat plateau that shows up as a prominent peak in the histogram.
+1. Auto-detect sea level: prominent height peak in the lower histogram.
 
-2. Flood-fill from the map border: ocean cells are at-or-below sea level AND
-   reachable from the map edge without crossing higher terrain.  This robustly
-   identifies the sea while ignoring landlocked lakes and rivers.
+2. Ocean = water at-or-below sea level that is border-connected (reaches the
+   map edge without crossing higher terrain).  Landlocked lakes/rivers are
+   never marked ocean.
 
-3. Erode the ocean mask slightly so narrow coastal shallows and river mouths
-   are not accidentally treated as ocean (optional, controlled by margin_blocks).
+3. Optionally also mark very large landlocked water bodies as ocean.
+
+4. Micro-island removal: connected land components smaller than
+   min_land_area blocks are absorbed into the ocean mask so they don't
+   show up as noise in the image or STL.
 """
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
-from scipy.ndimage import binary_fill_holes, binary_erosion, label
+from scipy.ndimage import binary_erosion, label
 
 
 # ── Sea-level auto-detection ─────────────────────────────────────────────────
 
 def detect_sea_level(heightmap: np.ndarray) -> int:
     """
-    Return the most likely sea-level Y by finding the dominant height value
-    in the lower half of the height distribution.
+    Return the most likely sea-level Y.
+
+    Looks for the dominant (most frequent) height value in the lower 60th
+    percentile of the distribution — where the flat water surface creates a
+    histogram plateau.
     """
     flat = heightmap.flatten().astype(np.int32)
-    # Work within [min, median] to focus on flat water areas
     lo = int(flat.min())
-    hi = int(np.percentile(flat, 60))   # 60th percentile keeps us in low zone
-
+    hi = int(np.percentile(flat, 60))
     if lo >= hi:
         return lo
-
     sub = flat[(flat >= lo) & (flat <= hi)]
     counts = np.bincount(sub - lo)
     return lo + int(np.argmax(counts))
 
 
-# ── Ocean mask ───────────────────────────────────────────────────────────────
+# ── Connected-component helpers ───────────────────────────────────────────────
 
-def _border_connected_components(candidate: np.ndarray) -> np.ndarray:
-    """
-    Return a mask of all True cells in `candidate` that belong to a connected
-    component touching the map border (4-connectivity).
-    """
-    from scipy.ndimage import label as _label
-
-    labeled, n = _label(candidate)
+def _components_touching_border(mask: np.ndarray) -> np.ndarray:
+    """Return boolean mask of all True cells whose component touches the edge."""
+    labeled, n = label(mask)
     if n == 0:
-        return np.zeros_like(candidate, dtype=bool)
-
-    # Which component IDs touch the border?
-    border_ids = set()
+        return np.zeros_like(mask, dtype=bool)
+    border_ids: set = set()
     for edge in (labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]):
         for cid in np.unique(edge):
             if cid != 0:
                 border_ids.add(int(cid))
-
-    ocean = np.zeros_like(candidate, dtype=bool)
+    result = np.zeros_like(mask, dtype=bool)
     for cid in border_ids:
-        ocean |= labeled == cid
-    return ocean
+        result |= labeled == cid
+    return result
 
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def build_ocean_mask(
     heightmap: np.ndarray,
@@ -74,57 +69,78 @@ def build_ocean_mask(
     margin_blocks: int = 0,
 ) -> np.ndarray:
     """
-    Return a boolean mask where True = ocean (large open-sea water body).
+    Return boolean mask: True = open sea.
 
-    Rivers, lakes, and small coastal bays are NOT marked as ocean.
+    Rivers, lakes, and small coastal bays are NOT marked ocean.
 
     Parameters
     ----------
-    heightmap       : 2-D float/int heightmap array
-    sea_level       : Y value of the water surface
-    min_ocean_blocks: connected-component area threshold; components smaller
-                      than this are kept as rivers/lakes (not masked out).
-                      For WesterosEssos-scale maps a value of 500_000–2_000_000
-                      works well.  Set to 0 to disable (border-flood only).
-    margin_blocks   : erode the ocean mask inward by this many blocks so that
-                      shallow coastal pixels are retained as "land".
+    min_ocean_blocks : Connected-component area threshold.  Landlocked water
+                       bodies larger than this are also treated as ocean.
+                       Set to 0 to use border-connectivity only.
+    margin_blocks    : Erode the ocean mask inward by this many blocks so
+                       shallow coastal pixels are kept as land.
     """
-    # Candidate water: at or below sea level
     candidate = heightmap <= sea_level
 
-    # ── Method A: border-connected components ─────────────────────────────
-    # Ocean is water reachable from the map edge.  This naturally excludes
-    # landlocked lakes no matter how large.
-    ocean = _border_connected_components(candidate)
+    # Border-connected water → open sea
+    ocean = _components_touching_border(candidate)
 
-    # ── Method B: area threshold (belt-and-suspenders) ────────────────────
-    # Additionally mark very large landlocked water bodies as ocean.
+    # Very large landlocked water bodies → also ocean
     if min_ocean_blocks > 0:
         labeled, n = label(candidate)
-        for comp_id in range(1, n + 1):
-            comp = labeled == comp_id
+        for cid in range(1, n + 1):
+            comp = labeled == cid
             if comp.sum() >= min_ocean_blocks:
                 ocean |= comp
 
-    # ── Coastal margin erosion ────────────────────────────────────────────
     if margin_blocks > 0:
-        struct = np.ones((margin_blocks * 2 + 1, margin_blocks * 2 + 1), dtype=bool)
+        struct = np.ones(
+            (margin_blocks * 2 + 1, margin_blocks * 2 + 1), dtype=bool
+        )
         ocean = binary_erosion(ocean, structure=struct)
 
     return ocean
 
 
-# ── Apply mask to heightmap ───────────────────────────────────────────────────
+def remove_micro_islands(
+    heightmap: np.ndarray,
+    ocean_mask: np.ndarray,
+    sea_level: int,
+    min_land_area: int,
+) -> np.ndarray:
+    """
+    Absorb land components smaller than min_land_area blocks into the ocean.
+
+    Returns an updated ocean_mask with small islands marked as sea.
+
+    Parameters
+    ----------
+    min_land_area : Land components with fewer blocks than this are removed.
+                    Typical values: 500–5000 for noise dots; 50000 for tiny
+                    uninhabited islands you want to keep.
+    """
+    if min_land_area <= 0:
+        return ocean_mask
+
+    land = ~ocean_mask
+    labeled, n = label(land)
+
+    new_mask = ocean_mask.copy()
+    for cid in range(1, n + 1):
+        comp = labeled == cid
+        if int(comp.sum()) < min_land_area:
+            new_mask |= comp   # absorb into ocean
+
+    return new_mask
+
 
 def apply_ocean_mask(
     heightmap: np.ndarray,
     ocean_mask: np.ndarray,
     sea_level: int,
 ) -> np.ndarray:
-    """
-    Replace ocean cells with sea_level so they form a flat base in the output.
-    Non-ocean water (rivers, lakes) keeps its original height.
-    """
+    """Replace ocean cells with sea_level; non-ocean water keeps its height."""
     result = heightmap.copy()
     result[ocean_mask] = sea_level
     return result
