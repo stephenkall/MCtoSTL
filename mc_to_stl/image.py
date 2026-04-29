@@ -18,15 +18,19 @@ Contrast stretch
 By default the colour range is normalised to the [2nd, 98th] percentile
 of land heights so isolated peaks or submerged valleys don't collapse
 the gradient for the majority of the terrain.
+
+Memory model
+------------
+The heightmap is downsampled to the output pixel dimensions BEFORE any
+processing so that all intermediate arrays are output-sized, not
+source-sized.  A 16k-block map rendered at 4096 px saves ~15× RAM.
 """
 
 from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageFilter
-from scipy.ndimage import gaussian_filter
-from tqdm import tqdm
-
+from scipy.ndimage import gaussian_filter, zoom
 
 _OCEAN_RGB = np.array([30, 80, 160], dtype=np.uint8)
 
@@ -34,12 +38,7 @@ _OCEAN_RGB = np.array([30, 80, 160], dtype=np.uint8)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _apply_gamma(rel: np.ndarray, gamma: float) -> np.ndarray:
-    """
-    Apply gamma to relative altitude, preserving sign.
-    gamma < 1  → stretch low relief  (more dramatic-looking flat terrain)
-    gamma > 1  → compress peaks      (rarely needed)
-    gamma = 1  → no change
-    """
+    """Sign-preserving power curve; gamma < 1 stretches low relief."""
     if abs(gamma - 1.0) < 1e-6:
         return rel
     sign = np.sign(rel)
@@ -63,40 +62,38 @@ def _build_rgb(
     gamma: float,
     ocean_mask: Optional[np.ndarray],
 ) -> np.ndarray:
-    rel = (sm - sea_level).astype(np.float32)
+    """
+    Build uint8 RGB array from a (small, output-sized) smoothed heightmap.
 
-    # Apply gamma to amplify relief variation
-    rel_g = _apply_gamma(rel, gamma)
-
-    rgb = np.zeros((*rel.shape, 3), dtype=np.float32)
+    All intermediates are kept small: t_grid is float32 (one channel) and is
+    reused; the output `out` is uint8 (3 channels).
+    """
+    rows, cols = sm.shape
+    rel_g = _apply_gamma((sm - sea_level).astype(np.float32), gamma)
+    out = np.zeros((rows, cols, 3), dtype=np.uint8)
 
     # ── Positive (land above sea): green → red ────────────────────────────
     pos = rel_g >= 0
-    pos_vals = rel_g[pos]
-    if pos_vals.size > 0:
-        t = _percentile_norm(pos_vals, lo_pct=0.0, hi_pct=98.0)
-        tmp = np.zeros(rel.shape, dtype=np.float32)
-        tmp[pos] = t
-        rgb[..., 0] += np.where(pos, tmp * 255.0, 0.0)
-        rgb[..., 1] += np.where(pos, (1.0 - tmp) * 255.0, 0.0)
+    if pos.any():
+        t = _percentile_norm(rel_g[pos], lo_pct=0.0, hi_pct=98.0)
+        t_grid = np.zeros((rows, cols), dtype=np.float32)
+        t_grid[pos] = t
+        out[..., 0] = (t_grid * 255).astype(np.uint8)
+        out[..., 1] = ((1.0 - t_grid) * 255).astype(np.uint8)
 
     # ── Negative (below sea level): blue → green ──────────────────────────
-    neg = rel_g < 0
-    neg_vals = rel_g[neg]
-    if neg_vals.size > 0:
-        # Most-negative → 1.0 (pure blue), just-below-zero → 0.0 (green)
-        t = _percentile_norm(-neg_vals, lo_pct=0.0, hi_pct=98.0)
-        tmp = np.zeros(rel.shape, dtype=np.float32)
-        tmp[neg] = t
-        rgb[..., 1] += np.where(neg, (1.0 - tmp) * 255.0, 0.0)
-        rgb[..., 2] += np.where(neg, tmp * 255.0, 0.0)
-
-    result = np.clip(rgb, 0, 255).astype(np.uint8)
+    neg = ~pos
+    if neg.any():
+        t = _percentile_norm(-rel_g[neg], lo_pct=0.0, hi_pct=98.0)
+        t_grid = np.zeros((rows, cols), dtype=np.float32)
+        t_grid[neg] = t
+        out[neg, 1] = ((1.0 - t_grid[neg]) * 255).astype(np.uint8)
+        out[..., 2] = (t_grid * 255).astype(np.uint8)
 
     if ocean_mask is not None and ocean_mask.any():
-        result[ocean_mask] = _OCEAN_RGB
+        out[ocean_mask] = _OCEAN_RGB
 
-    return result
+    return out
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -114,41 +111,60 @@ def generate_image(
     """
     Generate a color-coded heightmap PNG.
 
-    Parameters
-    ----------
-    gamma       : Relief exaggeration exponent (< 1 = more drama on flat terrain).
-                  0.5–0.7 works well for Westeros/Essos-style maps.
+    Downsamples to output dimensions before all processing so that memory
+    usage scales with the output size, not the source map size.
     """
     rows, cols = heightmap.shape
     print(f"\n[Heightmap Image]")
+    print(f"  Map size     : {cols} × {rows} blocks")
+    print(f"  Sea level    : Y={sea_level:.0f}")
 
-    sm = gaussian_filter(heightmap.astype(np.float32), sigma=smooth_sigma)
+    # ── Compute output size ───────────────────────────────────────────────
+    scale = min(max_px_w / cols, max_px_h / rows)
+    out_w = max(1, int(round(cols * scale)))
+    out_h = max(1, int(round(rows * scale)))
+    print(f"  Output size  : {out_w} × {out_h} px  (scale {scale:.3f} px/block)")
 
-    land = sm[~ocean_mask] if ocean_mask is not None else sm.flatten()
+    # ── Downsample to output size FIRST (saves memory on large maps) ──────
+    if scale < 0.999:
+        print(f"  Downsampling …", end=" ", flush=True)
+        sm = zoom(heightmap.astype(np.float32),
+                  (out_h / rows, out_w / cols), order=1)
+        if ocean_mask is not None:
+            om_small = zoom(ocean_mask.astype(np.float32),
+                            (out_h / rows, out_w / cols), order=0) > 0.5
+        else:
+            om_small = None
+        print(f"done  ({sm.shape[1]} × {sm.shape[0]} px)")
+    else:
+        sm = heightmap.astype(np.float32)
+        om_small = ocean_mask
+
+    # ── Smooth at output resolution ───────────────────────────────────────
+    sigma_px = smooth_sigma * scale   # scale sigma to output pixels
+    if sigma_px > 0.1:
+        sm = gaussian_filter(sm, sigma=sigma_px)
+
+    # ── Stats (on original full-res data to be accurate) ─────────────────
+    land_mask = (~ocean_mask) if ocean_mask is not None else np.ones(heightmap.shape, dtype=bool)
+    land = heightmap[land_mask]
     land_rel = land - sea_level
     rel_max = float(land_rel.max()) if land_rel.size else 1.0
     rel_min = float(land_rel.min()) if land_rel.size else 0.0
-
-    print(f"  Map size     : {cols} × {rows} blocks")
-    print(f"  Sea level    : Y={sea_level:.0f}")
     print(f"  Land range   : {rel_min:+.0f} .. {rel_max:+.0f}  (relative to sea)")
     print(f"  Gamma        : {gamma:.2f}  ({'linear' if gamma == 1 else 'amplified' if gamma < 1 else 'compressed'})")
     if ocean_mask is not None:
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
         print(f"  Ocean cover  : {pct:.1f}%")
 
-    rgb = _build_rgb(sm, sea_level, gamma, ocean_mask)
+    # ── Build RGB and save ────────────────────────────────────────────────
+    print(f"  Building RGB …", end=" ", flush=True)
+    rgb = _build_rgb(sm, sea_level, gamma, om_small)
+    print("done")
+
     img = Image.fromarray(rgb, "RGB")
-
-    scale = min(max_px_w / cols, max_px_h / rows)
-    out_w = max(1, int(round(cols * scale)))
-    out_h = max(1, int(round(rows * scale)))
-    print(f"  Output size  : {out_w} × {out_h} px  (scale {scale:.3f} px/block)")
-
-    img = img.resize((out_w, out_h), Image.LANCZOS)
     img = img.filter(ImageFilter.SMOOTH_MORE)
     img = img.filter(ImageFilter.SMOOTH)
-
     img.save(output_path)
     print(f"  Saved → {output_path}")
     return img
