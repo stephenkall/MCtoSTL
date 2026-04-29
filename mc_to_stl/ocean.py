@@ -14,8 +14,21 @@ Strategy
 4. Micro-island removal: connected land components smaller than
    min_land_area blocks are absorbed into the ocean mask so they don't
    show up as noise in the image or STL.
+
+Performance notes
+-----------------
+scipy.ndimage.label() on a 16k×16k map takes several seconds but is
+unavoidable (it's a BFS flood-fill in C).  What we avoid is calling it
+more than once per function, and we replace per-component Python loops
+with vectorized LUT indexing:
+
+    sizes = np.bincount(labeled.ravel())        # O(N), all sizes at once
+    keep  = np.zeros(n+1, dtype=bool)
+    keep[wanted_ids] = True
+    mask  = keep[labeled]                        # O(N), one array pass
 """
 
+import time
 from typing import Optional
 
 import numpy as np
@@ -42,24 +55,6 @@ def detect_sea_level(heightmap: np.ndarray) -> int:
     return lo + int(np.argmax(counts))
 
 
-# ── Connected-component helpers ───────────────────────────────────────────────
-
-def _components_touching_border(mask: np.ndarray) -> np.ndarray:
-    """Return boolean mask of all True cells whose component touches the edge."""
-    labeled, n = label(mask)
-    if n == 0:
-        return np.zeros_like(mask, dtype=bool)
-    border_ids: set = set()
-    for edge in (labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]):
-        for cid in np.unique(edge):
-            if cid != 0:
-                border_ids.add(int(cid))
-    result = np.zeros_like(mask, dtype=bool)
-    for cid in border_ids:
-        result |= labeled == cid
-    return result
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def build_ocean_mask(
@@ -81,24 +76,47 @@ def build_ocean_mask(
     margin_blocks    : Erode the ocean mask inward by this many blocks so
                        shallow coastal pixels are kept as land.
     """
+    rows, cols = heightmap.shape
     candidate = heightmap <= sea_level
+    water_px = int(candidate.sum())
+    print(f"    Water pixels (≤ Y={sea_level}): {water_px:,} of {rows*cols:,}  "
+          f"({100.0*water_px/(rows*cols):.1f}%)")
 
-    # Border-connected water → open sea
-    ocean = _components_touching_border(candidate)
+    t0 = time.perf_counter()
+    print(f"    Labeling water components …", end=" ", flush=True)
+    labeled, n = label(candidate)
+    print(f"{n:,} components  ({time.perf_counter()-t0:.1f}s)")
 
-    # Very large landlocked water bodies → also ocean
+    # Component sizes in one O(N) pass
+    sizes = np.bincount(labeled.ravel())   # sizes[0] = background (non-water)
+
+    # Collect border-touching component IDs
+    border_ids: set = set()
+    for edge in (labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]):
+        border_ids.update(int(x) for x in np.unique(edge) if x != 0)
+
+    # Large landlocked bodies
     if min_ocean_blocks > 0:
-        labeled, n = label(candidate)
-        for cid in range(1, n + 1):
-            comp = labeled == cid
-            if comp.sum() >= min_ocean_blocks:
-                ocean |= comp
+        large_ids = set(int(i) for i in np.where(sizes >= min_ocean_blocks)[0] if i != 0)
+    else:
+        large_ids = set()
+
+    ocean_ids = border_ids | large_ids
+    print(f"    Ocean components: {len(border_ids)} border-connected"
+          + (f" + {len(large_ids - border_ids)} large landlocked" if large_ids else ""))
+
+    # Build mask via LUT — O(N), no Python loop over components
+    lut = np.zeros(n + 1, dtype=bool)
+    for cid in ocean_ids:
+        lut[cid] = True
+    ocean = lut[labeled]
 
     if margin_blocks > 0:
-        struct = np.ones(
-            (margin_blocks * 2 + 1, margin_blocks * 2 + 1), dtype=bool
-        )
+        t1 = time.perf_counter()
+        print(f"    Eroding ocean mask by {margin_blocks} block(s) …", end=" ", flush=True)
+        struct = np.ones((margin_blocks * 2 + 1, margin_blocks * 2 + 1), dtype=bool)
         ocean = binary_erosion(ocean, structure=struct)
+        print(f"{time.perf_counter()-t1:.1f}s")
 
     return ocean
 
@@ -124,15 +142,35 @@ def remove_micro_islands(
         return ocean_mask
 
     land = ~ocean_mask
+    t0 = time.perf_counter()
+    print(f"    Labeling land components …", end=" ", flush=True)
     labeled, n = label(land)
+    print(f"{n:,} components  ({time.perf_counter()-t0:.1f}s)")
 
-    new_mask = ocean_mask.copy()
-    for cid in range(1, n + 1):
-        comp = labeled == cid
-        if int(comp.sum()) < min_land_area:
-            new_mask |= comp   # absorb into ocean
+    if n == 0:
+        return ocean_mask
 
-    return new_mask
+    # All component sizes in one pass
+    sizes = np.bincount(labeled.ravel())   # sizes[0] = ocean/background
+
+    # IDs of components below threshold (exclude background 0)
+    small_ids = np.where((sizes > 0) & (sizes < min_land_area))[0]
+    small_ids = small_ids[small_ids > 0]
+
+    if len(small_ids) == 0:
+        print(f"    No micro-islands found (threshold {min_land_area:,} blocks).")
+        return ocean_mask
+
+    print(f"    Removing {len(small_ids):,} micro-island component(s) "
+          f"(< {min_land_area:,} blocks each) …", end=" ", flush=True)
+
+    # Build mask via LUT — one array pass, no Python loop
+    lut = np.zeros(n + 1, dtype=bool)
+    lut[small_ids] = True
+    micro = lut[labeled]
+
+    print(f"{int(micro.sum()):,} blocks absorbed.")
+    return ocean_mask | micro
 
 
 def apply_ocean_mask(
