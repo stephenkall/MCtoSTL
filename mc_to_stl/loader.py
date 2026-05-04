@@ -1,15 +1,20 @@
 """
-Load a Minecraft Java Edition save directory into a full heightmap array.
+Load a Minecraft save directory into a full heightmap array.
 
-Parallelism
------------
+Supports both editions:
+  Java Edition   — parses .mca region files (Anvil format)
+  Bedrock Edition — reads the LevelDB database in <world>/db/
+
+Java parallelism
+----------------
 Parsing .mca files is CPU-bound (zlib/gzip + NBT parsing).  We use
 ProcessPoolExecutor so each worker gets its own Python interpreter and
 bypasses the GIL.  Cache hits are resolved in the main process (fast I/O),
 so workers only do real work on uncached files.
 
 Cache layout (inside out_dir):
-  .chunk_cache/r.X.Z.npy  –  dict {(cx,cz): 16×16 int32 array}
+  .chunk_cache/r.X.Z.npy   – Java: one file per region
+  .chunk_cache/bedrock.npy  – Bedrock: full chunk dict
 """
 
 import glob
@@ -23,9 +28,38 @@ from scipy.ndimage import distance_transform_edt
 from tqdm import tqdm
 
 from .anvil import parse_region, diagnose_region
+from .bedrock import parse_bedrock_world, diagnose_bedrock_world
 
 
-# ── Region directory lookup ───────────────────────────────────────────────────
+# ── Format detection ──────────────────────────────────────────────────────────
+
+def detect_save_format(save_path: str) -> str:
+    """Return 'java' or 'bedrock'; raises FileNotFoundError if neither matches."""
+    # Java: has region/ subfolder with at least one .mca file
+    for candidate in [
+        os.path.join(save_path, "region"),
+        os.path.join(save_path, "DIM0", "region"),
+        os.path.join(save_path, "world", "region"),
+    ]:
+        if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "r.*.*.mca")):
+            return "java"
+
+    # Bedrock: has db/ subfolder with LevelDB files
+    db_path = os.path.join(save_path, "db")
+    if os.path.isdir(db_path) and (
+        os.path.exists(os.path.join(db_path, "MANIFEST")) or
+        glob.glob(os.path.join(db_path, "*.ldb"))
+    ):
+        return "bedrock"
+
+    raise FileNotFoundError(
+        f"Cannot determine Minecraft save format for '{save_path}'.\n"
+        "  Java Edition   : expects <save>/region/r.X.Z.mca files\n"
+        "  Bedrock Edition: expects <save>/db/MANIFEST (LevelDB)"
+    )
+
+
+# ── Region directory lookup (Java only) ──────────────────────────────────────
 
 def find_region_dir(save_path: str) -> str:
     candidates = [
@@ -45,13 +79,19 @@ def find_region_dir(save_path: str) -> str:
 # ── Diagnostics ───────────────────────────────────────────────────────────────
 
 def diagnose_save(save_path: str, n_regions: int = 2, chunks_per: int = 3) -> None:
-    region_path = find_region_dir(save_path)
-    files = sorted(glob.glob(os.path.join(region_path, "r.*.*.mca")))[:n_regions]
-    if not files:
-        print("  No .mca files found.")
-        return
-    for fp in files:
-        diagnose_region(fp, max_chunks=chunks_per)
+    fmt = detect_save_format(save_path)
+    if fmt == "bedrock":
+        print(f"  Format: Bedrock Edition (LevelDB)")
+        diagnose_bedrock_world(os.path.join(save_path, "db"), max_chunks=chunks_per)
+    else:
+        print(f"  Format: Java Edition (Anvil)")
+        region_path = find_region_dir(save_path)
+        files = sorted(glob.glob(os.path.join(region_path, "r.*.*.mca")))[:n_regions]
+        if not files:
+            print("  No .mca files found.")
+            return
+        for fp in files:
+            diagnose_region(fp, max_chunks=chunks_per)
 
 
 # ── Chunk-level caching ───────────────────────────────────────────────────────
@@ -90,6 +130,85 @@ def _parse_worker(args: Tuple) -> Tuple[str, Dict]:
     return filepath, chunks
 
 
+# ── Heightmap assembly (shared by both editions) ──────────────────────────────
+
+def _assemble_heightmap(
+    all_chunks: Dict[Tuple[int, int], np.ndarray],
+) -> Tuple[np.ndarray, Dict]:
+    """Stitch chunk heightmaps into one 2-D float32 array; fill gaps via EDT."""
+    positions = list(all_chunks.keys())
+    min_cx = min(p[0] for p in positions)
+    max_cx = max(p[0] for p in positions)
+    min_cz = min(p[1] for p in positions)
+    max_cz = max(p[1] for p in positions)
+
+    width_blocks  = (max_cx - min_cx + 1) * 16
+    height_blocks = (max_cz - min_cz + 1) * 16
+    print(f"  Map extent : {width_blocks:,} × {height_blocks:,} blocks")
+
+    heightmap = np.zeros((height_blocks, width_blocks), dtype=np.float32)
+    filled    = np.zeros((height_blocks, width_blocks), dtype=bool)
+
+    for (cx, cz), chunk_hm in all_chunks.items():
+        row = (cz - min_cz) * 16
+        col = (cx - min_cx) * 16
+        heightmap[row:row+16, col:col+16] = chunk_hm
+        filled   [row:row+16, col:col+16] = True
+
+    if not filled.all():
+        missing = int((~filled).sum())
+        print(f"  Filling {missing:,} missing block columns via nearest-neighbour.")
+        _, nearest = distance_transform_edt(~filled, return_indices=True)
+        heightmap[~filled] = heightmap[nearest[0][~filled], nearest[1][~filled]]
+
+    meta = {
+        "width_blocks":  width_blocks,
+        "height_blocks": height_blocks,
+        "min_cx": min_cx, "max_cx": max_cx,
+        "min_cz": min_cz, "max_cz": max_cz,
+    }
+    return heightmap, meta
+
+
+# ── Bedrock loader ────────────────────────────────────────────────────────────
+
+def _load_bedrock(
+    save_path: str,
+    out_dir: Optional[str],
+    debug: bool,
+    use_cache: bool,
+) -> Tuple[np.ndarray, Dict]:
+    db_path = os.path.join(save_path, "db")
+    print(f"  Format  : Bedrock Edition")
+    print(f"  DB path : {db_path}")
+
+    cache_file = os.path.join(_cache_dir(out_dir), "bedrock.npy") if out_dir else None
+
+    if use_cache and cache_file:
+        cached = _load_cached_chunks(cache_file)
+        if cached is not None:
+            print(f"  {len(cached):,} chunks loaded from cache.")
+            hm, meta = _assemble_heightmap(cached)
+            meta["format"] = "bedrock"
+            return hm, meta
+
+    all_chunks = parse_bedrock_world(db_path, debug=debug)
+    print(f"  Total: {len(all_chunks):,} chunks with heightmap data.")
+
+    if not all_chunks:
+        raise ValueError(
+            "No Data2D heightmap records found in the Bedrock database.\n"
+            "Run with --diagnose to inspect the world."
+        )
+
+    if use_cache and cache_file:
+        _save_cached_chunks(cache_file, all_chunks)
+
+    hm, meta = _assemble_heightmap(all_chunks)
+    meta["format"] = "bedrock"
+    return hm, meta
+
+
 # ── Main loader ───────────────────────────────────────────────────────────────
 
 def load_save(
@@ -102,20 +221,26 @@ def load_save(
     detect_floating: bool = False,
 ) -> Tuple[np.ndarray, Dict]:
     """
-    Load all region files from a Minecraft save.
+    Load a Minecraft save (Java or Bedrock Edition) into a heightmap array.
 
     Parameters
     ----------
-    out_dir     : Cache directory; resumed runs skip already-parsed files.
-    ground_only : Use terrain-only heightmap (skips trees/structures).
-    use_cache   : Read/write chunk cache (default True).
-    n_workers   : Number of parallel processes (0 = all available CPUs).
+    out_dir        : Cache directory; resumed runs skip re-parsing.
+    ground_only    : Java only — use terrain-only heightmap (skips trees/structures).
+    use_cache      : Read/write chunk cache (default True).
+    n_workers      : Java only — parallel worker processes (0 = all CPUs).
+    detect_floating: Java only — remove floating block artefacts.
 
     Returns
     -------
     heightmap : np.ndarray  shape (Z_blocks, X_blocks), float32
-    meta      : dict  width_blocks, height_blocks, chunk extents, region_path
+    meta      : dict  width_blocks, height_blocks, chunk extents, format
     """
+    fmt = detect_save_format(save_path)
+    if fmt == "bedrock":
+        return _load_bedrock(save_path, out_dir, debug, use_cache)
+
+    # ── Java Edition ──────────────────────────────────────────────────────
     region_path = find_region_dir(save_path)
     mca_files = sorted(glob.glob(os.path.join(region_path, "r.*.*.mca")))
 
@@ -189,38 +314,7 @@ def load_save(
             "Run with --diagnose to inspect the save format."
         )
 
-    # ── Assemble full heightmap array ─────────────────────────────────────
-    positions = list(all_chunks.keys())
-    min_cx = min(p[0] for p in positions)
-    max_cx = max(p[0] for p in positions)
-    min_cz = min(p[1] for p in positions)
-    max_cz = max(p[1] for p in positions)
-
-    width_blocks  = (max_cx - min_cx + 1) * 16
-    height_blocks = (max_cz - min_cz + 1) * 16
-
-    print(f"  Map extent : {width_blocks:,} × {height_blocks:,} blocks")
-
-    heightmap = np.zeros((height_blocks, width_blocks), dtype=np.float32)
-    filled    = np.zeros((height_blocks, width_blocks), dtype=bool)
-
-    for (cx, cz), chunk_hm in all_chunks.items():
-        row = (cz - min_cz) * 16
-        col = (cx - min_cx) * 16
-        heightmap[row : row + 16, col : col + 16] = chunk_hm
-        filled[row : row + 16, col : col + 16] = True
-
-    if not filled.all():
-        missing = int((~filled).sum())
-        print(f"  Filling {missing:,} missing block columns via nearest-neighbour.")
-        _, nearest = distance_transform_edt(~filled, return_indices=True)
-        heightmap[~filled] = heightmap[nearest[0][~filled], nearest[1][~filled]]
-
-    meta = {
-        "width_blocks":  width_blocks,
-        "height_blocks": height_blocks,
-        "min_cx": min_cx, "max_cx": max_cx,
-        "min_cz": min_cz, "max_cz": max_cz,
-        "region_path": region_path,
-    }
-    return heightmap, meta
+    hm, meta = _assemble_heightmap(all_chunks)
+    meta["region_path"] = region_path
+    meta["format"] = "java"
+    return hm, meta

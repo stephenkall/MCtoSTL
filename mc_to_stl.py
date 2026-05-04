@@ -27,7 +27,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from mc_to_stl.checkpoint import Checkpoint
-from mc_to_stl.loader import load_save, diagnose_save
+from mc_to_stl.loader import load_save, diagnose_save, detect_save_format
 from mc_to_stl.image import generate_image
 from mc_to_stl.mesh import generate_single_stl, generate_mosaic_stl
 from mc_to_stl.ocean import (
@@ -114,26 +114,43 @@ def collect_params(saved: Dict = None) -> Dict:
         print(f"\n  ✗  '{save_path}' is not a directory.")
         sys.exit(1)
 
+    # Detect edition so we can skip inapplicable prompts
+    try:
+        save_fmt = detect_save_format(save_path)
+    except FileNotFoundError as e:
+        print(f"\n  ✗  {e}")
+        sys.exit(1)
+    is_bedrock = save_fmt == "bedrock"
+    print(f"  Detected: {'Bedrock Edition' if is_bedrock else 'Java Edition'}")
+
     _sec("Output")
     out_dir = _ask_path("Output directory", default=d("out_dir", "mc_output"))
 
-    _sec("Performance")
-    import multiprocessing as _mp
-    _cpu = _mp.cpu_count()
-    print(f"  System has {_cpu} CPU core(s).")
-    print(f"  Each worker parses one .mca region file in parallel.")
-    print(f"  After the first run, results are cached — subsequent runs are instant.")
-    n_workers = _ask_int(
-        f"Parallel workers for chunk loading",
-        d("n_workers", _cpu),
-        mn=1,
-    )
+    # ── Java-only: parallelism ────────────────────────────────────────────
+    if not is_bedrock:
+        _sec("Performance  (Java Edition)")
+        import multiprocessing as _mp
+        _cpu = _mp.cpu_count()
+        print(f"  System has {_cpu} CPU core(s).")
+        print(f"  Each worker parses one .mca region file in parallel.")
+        print(f"  After the first run, results are cached — subsequent runs are instant.")
+        n_workers = _ask_int(
+            "Parallel workers for chunk loading",
+            d("n_workers", _cpu),
+            mn=1,
+        )
+    else:
+        n_workers = 1  # Bedrock is a single sequential DB read
 
-    _sec("Block Filtering")
-    print("  ground_only = YES  →  ignore trees, plants, man-made structures")
-    print("                        (uses MOTION_BLOCKING_NO_LEAVES or scans sections)")
-    print("  ground_only = NO   →  use WORLD_SURFACE (faster, includes everything)")
-    ground_only = _ask_bool("Ground-only heightmap?", default=d("ground_only", True))
+    # ── Java-only: block filtering ────────────────────────────────────────
+    if not is_bedrock:
+        _sec("Block Filtering  (Java Edition)")
+        print("  ground_only = YES  →  ignore trees, plants, man-made structures")
+        print("                        (uses MOTION_BLOCKING_NO_LEAVES or scans sections)")
+        print("  ground_only = NO   →  use WORLD_SURFACE (faster, includes everything)")
+        ground_only = _ask_bool("Ground-only heightmap?", default=d("ground_only", True))
+    else:
+        ground_only = False  # Bedrock Data2D is always surface (no filtering option)
 
     _sec("Anti-aliasing  (Gaussian blur — applied to all outputs)")
     print("  Recommended: 1.0–2.0  |  0 = none  |  higher = smoother")
@@ -162,16 +179,20 @@ def collect_params(saved: Dict = None) -> Dict:
             d("min_land_area", 2_000), mn=0,
         )
 
-    _sec("Floating Block Removal")
-    print("  When enabled, chunk parsing uses full 3D connectivity analysis:")
-    print("  blocks are only included if they are connected (6-directional)")
-    print("  to the bottom section of their chunk.  Floating platforms,")
-    print("  isolated artefacts, and hanging blocks are discarded at any")
-    print("  altitude — no height threshold.  Overhangs are safe: they")
-    print("  connect to their cliff face through horizontal neighbours.")
-    print("  Note: bypasses pre-computed Heightmaps; ~2-3x slower per chunk.")
-    detect_floating = _ask_bool("Remove floating block artefacts (3D)?",
-                                default=d("detect_floating", False))
+    # ── Java-only: floating block removal ────────────────────────────────
+    if not is_bedrock:
+        _sec("Floating Block Removal  (Java Edition)")
+        print("  When enabled, chunk parsing uses full 3D connectivity analysis:")
+        print("  blocks are only included if they are connected (6-directional)")
+        print("  to the bottom section of their chunk.  Floating platforms,")
+        print("  isolated artefacts, and hanging blocks are discarded at any")
+        print("  altitude — no height threshold.  Overhangs are safe: they")
+        print("  connect to their cliff face through horizontal neighbours.")
+        print("  Note: bypasses pre-computed Heightmaps; ~2-3x slower per chunk.")
+        detect_floating = _ask_bool("Remove floating block artefacts (3D)?",
+                                    default=d("detect_floating", False))
+    else:
+        detect_floating = False
 
     _sec("Heightmap Image")
     print("  Color: sea level = green, max altitude = red, below sea = blue")
