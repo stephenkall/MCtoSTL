@@ -32,7 +32,6 @@ from mc_to_stl.image import generate_image
 from mc_to_stl.mesh import generate_single_stl, generate_mosaic_stl
 from mc_to_stl.ocean import (
     detect_sea_level, build_ocean_mask, remove_micro_islands, apply_ocean_mask,
-    remove_floating_blocks,
 )
 
 
@@ -164,17 +163,15 @@ def collect_params(saved: Dict = None) -> Dict:
         )
 
     _sec("Floating Block Removal")
-    print("  Detects clusters of blocks at abnormally high altitude that are")
-    print("  completely surrounded by a sheer cliff (map-designer artefacts).")
-    print("  Safe for overhangs — those connect to terrain on at least one side.")
-    remove_flying   = _ask_bool("Remove floating block artefacts?",
-                                default=d("remove_flying", True))
-    fly_drop = d("fly_drop", 100)
-    if remove_flying:
-        fly_drop = _ask_int(
-            "Min height drop to neighbours to consider a cluster floating (blocks)",
-            d("fly_drop", 100), mn=10,
-        )
+    print("  When enabled, chunk parsing uses full 3D connectivity analysis:")
+    print("  blocks are only included if they are connected (6-directional)")
+    print("  to the bottom section of their chunk.  Floating platforms,")
+    print("  isolated artefacts, and hanging blocks are discarded at any")
+    print("  altitude — no height threshold.  Overhangs are safe: they")
+    print("  connect to their cliff face through horizontal neighbours.")
+    print("  Note: bypasses pre-computed Heightmaps; ~2-3x slower per chunk.")
+    detect_floating = _ask_bool("Remove floating block artefacts (3D)?",
+                                default=d("detect_floating", False))
 
     _sec("Heightmap Image")
     print("  Color: sea level = green, max altitude = red, below sea = blue")
@@ -215,8 +212,7 @@ def collect_params(saved: Dict = None) -> Dict:
         sea_level=sea_level,
         min_ocean_blocks=min_ocean_blocks,
         min_land_area=min_land_area,
-        remove_flying=remove_flying,
-        fly_drop=fly_drop,
+        detect_floating=detect_floating,
         max_px_w=max_px_w, max_px_h=max_px_h,
         gamma=gamma,
         max_x_mm=max_x_mm, max_y_mm=max_y_mm, max_z_mm=max_z_mm,
@@ -248,6 +244,7 @@ def stage_load(cp: Checkpoint, params: Dict):
             ground_only=params["ground_only"],
             use_cache=True,
             n_workers=params.get("n_workers", 0),
+            detect_floating=params.get("detect_floating", False),
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"\n  ✗  {exc}")
@@ -311,14 +308,6 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
 
     hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=sea_level)
-
-    if params.get("remove_flying", False):
-        print(f"\n  [Floating block removal]")
-        t2 = time.perf_counter()
-        hm_work = remove_floating_blocks(
-            hm_work, drop_threshold=params.get("fly_drop", 100)
-        )
-        print(f"    → done  ({time.perf_counter()-t2:.1f}s)")
 
     cp.save_work_heightmap(hm_work, ocean_mask)
     cp.cleanup_after_process()   # raw heightmap no longer needed
