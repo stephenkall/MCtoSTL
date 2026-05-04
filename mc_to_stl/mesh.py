@@ -151,6 +151,7 @@ def generate_single_stl(
     smooth_sigma: float,
     output_path: str,
     max_vertices: int = 2000,
+    ocean_mask: Optional[np.ndarray] = None,
 ) -> None:
     """Generate one watertight STL for the entire terrain."""
     print(f"\n[Single STL]")
@@ -158,6 +159,14 @@ def generate_single_stl(
     sm = gaussian_filter(heightmap.astype(np.float32), sigma=smooth_sigma)
     sm = downsample(sm, max_vertices)
     rows, cols = sm.shape
+
+    # Flatten ocean cells to global minimum so they print as base plate only,
+    # not as a raised flat sea-level surface.
+    if ocean_mask is not None:
+        om_small = zoom(ocean_mask.astype(np.float32),
+                        (rows / heightmap.shape[0], cols / heightmap.shape[1]),
+                        order=0) > 0.5
+        sm[om_small] = float(sm.min())
 
     h_range = float(sm.max() - sm.min())
     if h_range < 1e-6:
@@ -223,12 +232,15 @@ def generate_mosaic_stl(
     sm = downsample(sm, max_vertices)
     rows, cols = sm.shape
 
-    # Downsample ocean mask to match sm if provided
+    # Downsample ocean mask to match sm whenever provided.
+    # Flatten ocean cells to global minimum so they print as base plate only —
+    # the coastline ends at the shore rather than extending as a flat sea plate.
     om_small: Optional[np.ndarray] = None
-    if ocean_mask is not None and skip_ocean:
+    if ocean_mask is not None:
         om_small = zoom(ocean_mask.astype(np.float32),
                         (rows / heightmap.shape[0], cols / heightmap.shape[1]),
                         order=0) > 0.5
+        sm[om_small] = float(sm.min())
 
     h_min_global = float(sm.min())
     h_range = float(sm.max() - sm.min())
@@ -259,7 +271,7 @@ def generate_mosaic_stl(
 
     # Pre-count ocean-only tiles so we can report them
     ocean_skipped = 0
-    if om_small is not None:
+    if om_small is not None and skip_ocean:
         filtered = []
         for tz, tx in to_do:
             c0 = tx * stride_c
