@@ -22,12 +22,17 @@ import time
 from datetime import datetime
 from typing import Any, Dict
 
+# Ensure UTF-8 output on Windows (arrows, em-dashes, etc.)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from mc_to_stl.checkpoint import Checkpoint
 from mc_to_stl.loader import load_save, diagnose_save
 from mc_to_stl.image import generate_image
 from mc_to_stl.mesh import generate_single_stl, generate_mosaic_stl
 from mc_to_stl.ocean import (
     detect_sea_level, build_ocean_mask, remove_micro_islands, apply_ocean_mask,
+    remove_floating_blocks,
 )
 
 
@@ -158,6 +163,19 @@ def collect_params(saved: Dict = None) -> Dict:
             d("min_land_area", 2_000), mn=0,
         )
 
+    _sec("Floating Block Removal")
+    print("  Detects clusters of blocks at abnormally high altitude that are")
+    print("  completely surrounded by a sheer cliff (map-designer artefacts).")
+    print("  Safe for overhangs — those connect to terrain on at least one side.")
+    remove_flying   = _ask_bool("Remove floating block artefacts?",
+                                default=d("remove_flying", True))
+    fly_drop = d("fly_drop", 100)
+    if remove_flying:
+        fly_drop = _ask_int(
+            "Min height drop to neighbours to consider a cluster floating (blocks)",
+            d("fly_drop", 100), mn=10,
+        )
+
     _sec("Heightmap Image")
     print("  Color: sea level = green, max altitude = red, below sea = blue")
     print("  Gamma < 1.0 amplifies low-relief areas (0.5–0.7 recommended for flat maps)")
@@ -166,8 +184,9 @@ def collect_params(saved: Dict = None) -> Dict:
     gamma     = _ask_float("Relief gamma", d("gamma", 0.6), mn=0.05)
 
     _sec("STL Physical Dimensions")
-    print("  X/Y scales follow max_x / max_y.  Z scale is independent.")
-    print("  For a dramatic relief print, set Z much larger than X/Y ratio.")
+    print("  These are MAXIMUM bounds — aspect ratio is preserved.")
+    print("  A 2000×1400 mm limit on a square map produces ~1400×1400 mm.")
+    print("  Z scale is independent of XY.")
     max_x_mm  = _ask_float("Max X  (mm)", d("max_x_mm", 200.0))
     max_y_mm  = _ask_float("Max Y  (mm)", d("max_y_mm", 200.0))
     max_z_mm  = _ask_float("Max Z  (altitude, mm)", d("max_z_mm", 30.0))
@@ -179,9 +198,13 @@ def collect_params(saved: Dict = None) -> Dict:
     max_verts = _ask_int("Max vertices (longest side)", d("max_verts", 1500))
 
     _sec("Mosaic Tile Dimensions")
-    print(f"  Full model: {max_x_mm} × {max_y_mm} mm")
-    tile_x_mm = _ask_float("Tile width  (mm)", d("tile_x_mm", min(100.0, max_x_mm)))
-    tile_y_mm = _ask_float("Tile height (mm)", d("tile_y_mm", min(100.0, max_y_mm)))
+    print(f"  Full model fits within {max_x_mm} × {max_y_mm} mm (aspect preserved).")
+    tile_x_mm  = _ask_float("Tile width  (mm)", d("tile_x_mm", min(100.0, max_x_mm)))
+    tile_y_mm  = _ask_float("Tile height (mm)", d("tile_y_mm", min(100.0, max_y_mm)))
+    skip_ocean_stl = _ask_bool(
+        "Skip ocean-only tiles in mosaic? (saves filament on water-heavy maps)",
+        default=d("skip_ocean_stl", True),
+    )
 
     return dict(
         save_path=save_path, out_dir=out_dir,
@@ -192,12 +215,15 @@ def collect_params(saved: Dict = None) -> Dict:
         sea_level=sea_level,
         min_ocean_blocks=min_ocean_blocks,
         min_land_area=min_land_area,
+        remove_flying=remove_flying,
+        fly_drop=fly_drop,
         max_px_w=max_px_w, max_px_h=max_px_h,
         gamma=gamma,
         max_x_mm=max_x_mm, max_y_mm=max_y_mm, max_z_mm=max_z_mm,
         base_mm=base_mm,
         max_verts=max_verts,
         tile_x_mm=tile_x_mm, tile_y_mm=tile_y_mm,
+        skip_ocean_stl=skip_ocean_stl,
     )
 
 
@@ -230,6 +256,7 @@ def stage_load(cp: Checkpoint, params: Dict):
 
     print(f"  Height range: Y={hm.min():.0f} .. Y={hm.max():.0f}")
     cp.save_raw_heightmap(hm)
+    cp.cleanup_after_load()   # chunk cache no longer needed
     return hm
 
 
@@ -284,7 +311,17 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
 
     hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=sea_level)
+
+    if params.get("remove_flying", False):
+        print(f"\n  [Floating block removal]")
+        t2 = time.perf_counter()
+        hm_work = remove_floating_blocks(
+            hm_work, drop_threshold=params.get("fly_drop", 100)
+        )
+        print(f"    → done  ({time.perf_counter()-t2:.1f}s)")
+
     cp.save_work_heightmap(hm_work, ocean_mask)
+    cp.cleanup_after_process()   # raw heightmap no longer needed
     return hm_work, ocean_mask
 
 
@@ -320,7 +357,7 @@ def stage_stl(cp: Checkpoint, params: Dict, hm_work):
     cp.mark_done("stl")
 
 
-def stage_mosaic(cp: Checkpoint, params: Dict, hm_work):
+def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
     tiles_dir = os.path.join(params["out_dir"], "tiles")
     existing = cp.existing_tiles(tiles_dir)
     if cp.is_done("mosaic") and not existing:
@@ -333,6 +370,8 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work):
         params["base_mm"], params["smooth_sigma"], tiles_dir,
         max_vertices=params["max_verts"],
         existing_tiles=existing,
+        ocean_mask=ocean_mask if params.get("skip_ocean_stl") else None,
+        skip_ocean=params.get("skip_ocean_stl", False),
     )
     cp.mark_done("mosaic")
 
@@ -409,7 +448,8 @@ def main() -> None:
     hm_work, ocean_mask = stage_process(cp, params, hm_raw)
     stage_image(cp, params, hm_work, ocean_mask)
     stage_stl(cp, params, hm_work)
-    stage_mosaic(cp, params, hm_work)
+    stage_mosaic(cp, params, hm_work, ocean_mask)
+    cp.cleanup_after_outputs()   # work heightmap + ocean mask no longer needed
 
     # ── Summary ───────────────────────────────────────────────────────────
     img_path  = os.path.join(out_dir, "heightmap.png")

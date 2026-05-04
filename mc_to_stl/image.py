@@ -166,5 +166,5 @@ def generate_image(
     img = img.filter(ImageFilter.SMOOTH_MORE)
     img = img.filter(ImageFilter.SMOOTH)
     img.save(output_path)
-    print(f"  Saved → {output_path}")
+    print(f"  Saved -> {output_path}")
     return img

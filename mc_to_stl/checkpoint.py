@@ -78,7 +78,34 @@ class Checkpoint:
             p = os.path.join(self.out_dir, name)
             if os.path.exists(p):
                 os.remove(p)
+        self._delete_chunk_cache()
         self._state = {}
+
+    # ── Incremental cleanup ───────────────────────────────────────────────
+
+    def _delete_chunk_cache(self) -> None:
+        """Remove the .chunk_cache directory (chunk NPY files)."""
+        import shutil
+        cache_dir = os.path.join(self.out_dir, ".chunk_cache")
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def cleanup_after_load(self) -> None:
+        """Delete chunk cache once the raw heightmap NPY is saved."""
+        self._delete_chunk_cache()
+
+    def cleanup_after_process(self) -> None:
+        """Delete raw heightmap NPY once the work heightmap is saved."""
+        p = os.path.join(self.out_dir, _RAW_HM_FILE)
+        if os.path.exists(p):
+            os.remove(p)
+
+    def cleanup_after_outputs(self) -> None:
+        """Delete work heightmap + ocean mask once all outputs are finished."""
+        for name in (_WORK_HM_FILE, _OCEAN_MASK_FILE):
+            p = os.path.join(self.out_dir, name)
+            if os.path.exists(p):
+                os.remove(p)
 
     # ── Parameters ────────────────────────────────────────────────────────
 
