@@ -198,8 +198,10 @@ def collect_params(saved: Dict = None) -> Dict:
     print(f"  Full model fits within {max_x_mm} × {max_y_mm} mm (aspect preserved).")
     tile_x_mm  = _ask_float("Tile width  (mm)", d("tile_x_mm", min(100.0, max_x_mm)))
     tile_y_mm  = _ask_float("Tile height (mm)", d("tile_y_mm", min(100.0, max_y_mm)))
+    print("  When ocean masking is on, ocean areas in every tile (including")
+    print("  coastal ones) print as base-plate only — no raised sea surface.")
     skip_ocean_stl = _ask_bool(
-        "Skip ocean-only tiles in mosaic? (saves filament on water-heavy maps)",
+        "Also skip tiles that are 100% ocean?",
         default=d("skip_ocean_stl", True),
     )
 
@@ -332,7 +334,7 @@ def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
     cp.mark_done("image")
 
 
-def stage_stl(cp: Checkpoint, params: Dict, hm_work):
+def stage_stl(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
     if cp.is_done("stl"):
         print("\n[Resume] terrain.stl already done — skipping.")
         return
@@ -342,6 +344,7 @@ def stage_stl(cp: Checkpoint, params: Dict, hm_work):
         params["max_x_mm"], params["max_y_mm"], params["max_z_mm"],
         params["base_mm"], params["smooth_sigma"], stl_path,
         max_vertices=params["max_verts"],
+        ocean_mask=ocean_mask,
     )
     cp.mark_done("stl")
 
@@ -359,7 +362,7 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         params["base_mm"], params["smooth_sigma"], tiles_dir,
         max_vertices=params["max_verts"],
         existing_tiles=existing,
-        ocean_mask=ocean_mask if params.get("skip_ocean_stl") else None,
+        ocean_mask=ocean_mask,
         skip_ocean=params.get("skip_ocean_stl", False),
     )
     cp.mark_done("mosaic")
@@ -436,7 +439,7 @@ def main() -> None:
     hm_raw   = stage_load(cp, params)
     hm_work, ocean_mask = stage_process(cp, params, hm_raw)
     stage_image(cp, params, hm_work, ocean_mask)
-    stage_stl(cp, params, hm_work)
+    stage_stl(cp, params, hm_work, ocean_mask)
     stage_mosaic(cp, params, hm_work, ocean_mask)
     cp.cleanup_after_outputs()   # work heightmap + ocean mask no longer needed
 
