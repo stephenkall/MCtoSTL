@@ -126,6 +126,20 @@ def collect_params(saved: Dict = None) -> Dict:
     _sec("Output")
     out_dir = _ask_path("Output directory", default=d("out_dir", "mc_output"))
 
+    if saved is None:
+        _cp_path = os.path.join(out_dir, ".checkpoint.json")
+        if os.path.exists(_cp_path):
+            try:
+                import json as _json
+                with open(_cp_path, encoding="utf-8") as _f:
+                    _cp_data = _json.load(_f)
+                _cp_params = _cp_data.get("params") or _cp_data
+                if _cp_params.get("save_path") == save_path:
+                    if _ask_bool("Checkpoint found - resume from where you left off?", default=True):
+                        p = _cp_params
+            except Exception:
+                pass
+
     # ── Java-only: parallelism ────────────────────────────────────────────
     if not is_bedrock:
         _sec("Performance  (Java Edition)")
@@ -406,31 +420,8 @@ def main() -> None:
         diagnose_save(save)
         return
 
-    # ── Check for existing checkpoint ─────────────────────────────────────
-    # We need the output directory before we can load a checkpoint, so peek
-    # at the first positional arg or ask briefly.
-    resume_params = None
-    cp_out_dir = None
-
-    # Quick peek: if a save path was given, try the default output dir
-    candidate_save = os.path.expanduser(args[0]) if args else None
-    if candidate_save:
-        candidate_out = os.path.join(os.path.dirname(candidate_save) or ".",
-                                     "mc_output")
-        test_cp = Checkpoint(candidate_out)
-        if not force_fresh and test_cp.load():
-            sp = test_cp.save_path
-            if sp == candidate_save:
-                done = test_cp.params.get("done", test_cp._state.get("done", []))
-                ts = test_cp._state.get("timestamp", "unknown time")
-                print(f"\n  Found checkpoint from {ts}")
-                print(f"  Completed stages: {', '.join(done) if done else 'none'}")
-                if _ask_bool("Resume previous session?", default=True):
-                    resume_params = test_cp.params
-                    cp_out_dir = candidate_out
-
-    # ── Collect all parameters (possibly pre-filled from checkpoint) ──────
-    params = collect_params(saved=resume_params)
+    # ── Collect all parameters ────────────────────────────────────────────
+    params = collect_params()
     out_dir = params["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
@@ -438,16 +429,8 @@ def main() -> None:
     cp = Checkpoint(out_dir)
     if force_fresh:
         cp.clear()
-    elif cp_out_dir == out_dir and resume_params:
-        cp.load()   # already loaded above, reload into this instance
     else:
-        # Check again with the final out_dir
-        if not force_fresh and cp.load() and cp.save_path == params["save_path"]:
-            done = cp._state.get("done", [])
-            if done:
-                print(f"\n  Existing checkpoint found ({', '.join(done)} done).")
-                if not _ask_bool("Resume?", default=True):
-                    cp.clear()
+        cp.load()
 
     params["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     cp.set_params(params)
