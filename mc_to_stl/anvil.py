@@ -214,38 +214,78 @@ def _decode_section(
     return None
 
 
-def _heightmap_from_sections(
-    chunk, ground_only: bool = False
-) -> Optional[np.ndarray]:
-    """
-    Compute a 16×16 surface heightmap by scanning block sections from top to
-    bottom and finding the highest non-air block in each column.
-    """
+def _section_map(chunk) -> Optional[Dict[int, object]]:
     sections_key = next((k for k in ("sections", "Sections") if k in chunk), None)
     if sections_key is None:
         return None
     sections = chunk[sections_key]
     if not sections:
         return None
-
-    section_map: Dict[int, object] = {}
+    sm: Dict[int, object] = {}
     for sec in sections:
         y = int(sec.get("Y", sec.get("y", 0)))
-        section_map[y] = sec
+        sm[y] = sec
+    return sm or None
 
-    if not section_map:
+
+def _heightmap_from_sections(
+    chunk,
+    ground_only: bool = False,
+    detect_floating: bool = False,
+) -> Optional[np.ndarray]:
+    """
+    Compute a 16×16 surface heightmap from block sections.
+
+    detect_floating=False (fast): top-down scan, returns highest non-air block.
+    detect_floating=True  (3D):   builds full 3D solid array per chunk, labels
+        connected components (scipy 6-connectivity), seeds "grounded" from the
+        bottom section (bedrock level), and returns the highest GROUNDED block
+        per column.  Truly isolated floating blocks are discarded with no height
+        threshold.  Overhangs are kept correctly because horizontal neighbours
+        are captured by the 6-connectivity labelling.
+    """
+    sm = _section_map(chunk)
+    if sm is None:
         return None
 
-    max_sy = max(section_map)
-    min_sy = min(section_map)
+    max_sy = max(sm)
+    min_sy = min(sm)
 
-    heightmap = np.zeros((16, 16), dtype=np.int32)
-    found = np.zeros((16, 16), dtype=bool)
+    if not detect_floating:
+        # ── Fast top-down scan ─────────────────────────────────────────────
+        heightmap = np.zeros((16, 16), dtype=np.int32)
+        found = np.zeros((16, 16), dtype=bool)
+        for sy in range(max_sy, min_sy - 1, -1):
+            if found.all():
+                break
+            sec = sm.get(sy)
+            if sec is None:
+                continue
+            try:
+                skip = _decode_section(sec, ground_only=ground_only)
+            except Exception:
+                continue
+            if skip is None:
+                continue
+            for ly in range(15, -1, -1):
+                solid = ~skip[ly]
+                mask = solid & ~found
+                if mask.any():
+                    heightmap[mask] = sy * 16 + ly + 1
+                    found |= mask
+        return heightmap
 
-    for sy in range(max_sy, min_sy - 1, -1):
-        if found.all():
-            break
-        sec = section_map.get(sy)
+    # ── 3D connected-component floating-block detection ────────────────────
+    from scipy.ndimage import label as _label
+
+    y_min   = min_sy * 16
+    y_max   = (max_sy + 1) * 16
+    n_y     = y_max - y_min          # number of Y levels in this chunk
+
+    # solid[iy, iz, ix] = True if the block is solid (not to be skipped)
+    solid = np.zeros((n_y, 16, 16), dtype=bool)
+    for sy in range(min_sy, max_sy + 1):
+        sec = sm.get(sy)
         if sec is None:
             continue
         try:
@@ -254,14 +294,44 @@ def _heightmap_from_sections(
             continue
         if skip is None:
             continue
-        for ly in range(15, -1, -1):
-            solid = ~skip[ly]            # shape (16, 16) = (z, x)
-            mask = solid & ~found
-            if mask.any():
-                heightmap[mask] = sy * 16 + ly + 1
-                found |= mask
+        y_off = (sy - min_sy) * 16
+        solid[y_off : y_off + 16] = ~skip     # (local_y, z, x)
 
-    return heightmap
+    if not solid.any():
+        return np.full((16, 16), y_min, dtype=np.int32)
+
+    labeled, _ = _label(solid)                # 6-connectivity (default)
+
+    # Grounded = components that include at least one block in the BOTTOM section.
+    # The bottom section is bedrock level — anything there is definitionally terrain.
+    bottom_slab = labeled[:16]                 # first 16 Y-levels
+    ground_ids_arr = np.unique(bottom_slab)
+    ground_ids_arr = ground_ids_arr[ground_ids_arr != 0]
+
+    if ground_ids_arr.size == 0:
+        # No blocks in the bottom section — seed from lowest available blocks.
+        for iy in range(n_y):
+            ids = np.unique(labeled[iy])
+            ids = ids[ids != 0]
+            if ids.size:
+                ground_ids_arr = ids
+                break
+
+    if ground_ids_arr.size == 0:
+        return np.full((16, 16), y_min, dtype=np.int32)
+
+    # Build a LUT: grounded[label_id] = True
+    lut = np.zeros(labeled.max() + 1, dtype=bool)
+    lut[ground_ids_arr] = True
+    grounded = lut[labeled]                    # (n_y, 16, 16) bool
+
+    # Highest grounded block per column, vectorised.
+    # Flip Y axis so argmax finds the TOPMOST grounded block.
+    has_any  = grounded.any(axis=0)            # (16, 16)
+    idx_top  = np.argmax(grounded[::-1], axis=0)   # index from top (0 = topmost)
+    # Actual Y of that block, then +1 for the "surface above" convention.
+    surface_y = (y_max - idx_top).astype(np.int32)
+    return np.where(has_any, surface_y, np.int32(y_min))
 
 
 # ── Per-chunk heightmap extraction ───────────────────────────────────────────
@@ -282,39 +352,48 @@ _HM_KEYS_GROUND = (
 
 
 def _extract_heightmap(
-    root: nbtlib.Compound, ground_only: bool = False
+    root: nbtlib.Compound,
+    ground_only: bool = False,
+    detect_floating: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Extract a 16×16 int32 heightmap from a parsed chunk Compound.
 
-    ground_only=False: standard WORLD_SURFACE (includes trees, structures)
-    ground_only=True:  prefers MOTION_BLOCKING_NO_LEAVES; section fallback
-                       skips plants, wood, and decorative blocks
+    ground_only=False:    standard WORLD_SURFACE (includes trees, structures)
+    ground_only=True:     prefers MOTION_BLOCKING_NO_LEAVES; section fallback
+                          skips plants, wood, and decorative blocks
+    detect_floating=True: always use section-based 3D connectivity analysis
+                          (bypasses Heightmaps compound) to exclude floating blocks
     """
     chunk = root.get("Level", root)
-    hm_keys = _HM_KEYS_GROUND if ground_only else _HM_KEYS_SURFACE
 
-    # 1 ── New format: Heightmaps compound (1.13+) ────────────────────────
-    if "Heightmaps" in chunk:
-        hm_c = chunk["Heightmaps"]
-        for key in hm_keys:
-            if key not in hm_c:
-                continue
-            longs = list(hm_c[key])
-            if not longs:
-                continue
-            vals = _unpack_longs(longs, bits=9, count=256)
-            if len(vals) == 256:
-                return np.array(vals, dtype=np.int32).reshape(16, 16)
+    # 3D floating-block detection requires section data — bypass stored heightmaps.
+    if not detect_floating:
+        hm_keys = _HM_KEYS_GROUND if ground_only else _HM_KEYS_SURFACE
 
-    # 2 ── Old format: HeightMap flat array (pre-1.13) ────────────────────
-    if "HeightMap" in chunk:
-        hm = list(chunk["HeightMap"])
-        if len(hm) >= 256:
-            return np.array([int(v) for v in hm[:256]], dtype=np.int32).reshape(16, 16)
+        # 1 ── New format: Heightmaps compound (1.13+) ────────────────────
+        if "Heightmaps" in chunk:
+            hm_c = chunk["Heightmaps"]
+            for key in hm_keys:
+                if key not in hm_c:
+                    continue
+                longs = list(hm_c[key])
+                if not longs:
+                    continue
+                vals = _unpack_longs(longs, bits=9, count=256)
+                if len(vals) == 256:
+                    return np.array(vals, dtype=np.int32).reshape(16, 16)
 
-    # 3 ── Fallback: compute from block sections ───────────────────────────
-    return _heightmap_from_sections(chunk, ground_only=ground_only)
+        # 2 ── Old format: HeightMap flat array (pre-1.13) ────────────────
+        if "HeightMap" in chunk:
+            hm = list(chunk["HeightMap"])
+            if len(hm) >= 256:
+                return np.array([int(v) for v in hm[:256]], dtype=np.int32).reshape(16, 16)
+
+    # 3 ── Section scan (always used when detect_floating=True) ───────────
+    return _heightmap_from_sections(
+        chunk, ground_only=ground_only, detect_floating=detect_floating
+    )
 
 
 # ── Region file parsing ──────────────────────────────────────────────────────
@@ -323,6 +402,7 @@ def parse_region(
     filepath: str,
     debug: bool = False,
     ground_only: bool = False,
+    detect_floating: bool = False,
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """
     Parse a single .mca file.
@@ -383,7 +463,8 @@ def parse_region(
                     print(f"    [chunk {i}] NBT parse returned None")
                 continue
 
-            hm = _extract_heightmap(root, ground_only=ground_only)
+            hm = _extract_heightmap(root, ground_only=ground_only,
+                                     detect_floating=detect_floating)
             if hm is None:
                 if debug:
                     chunk = root.get("Level", root)

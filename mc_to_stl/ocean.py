@@ -32,7 +32,7 @@ import time
 from typing import Optional
 
 import numpy as np
-from scipy.ndimage import binary_erosion, label
+from scipy.ndimage import binary_dilation, binary_erosion, label
 
 
 # ── Sea-level auto-detection ─────────────────────────────────────────────────
@@ -171,6 +171,73 @@ def remove_micro_islands(
 
     print(f"{int(micro.sum()):,} blocks absorbed.")
     return ocean_mask | micro
+
+
+def remove_floating_blocks(
+    heightmap: np.ndarray,
+    drop_threshold: int = 100,
+) -> np.ndarray:
+    """
+    Remove isolated high-altitude "floating block" clusters.
+
+    These are blocks placed by map designers that hover in mid-air — they
+    appear as small islands near the global altitude maximum that are
+    completely surrounded by a sheer cliff (all 4-connected neighbors are
+    drop_threshold+ blocks lower than the island's minimum height).
+
+    Overhangs that are part of real terrain are NOT removed: they connect to
+    at least one adjacent cell at similar altitude, so their island minimum is
+    close to at least one border neighbor.
+
+    Replacement value: the maximum height of the immediately adjacent cells
+    (the "implied ground level" were the floating cluster absent).
+
+    Parameters
+    ----------
+    drop_threshold : A cluster is considered floating when its minimum height
+                     exceeds the maximum height of all adjacent cells by at
+                     least this many blocks.  Default 100 is conservative; lower
+                     values catch more artifacts but risk flagging steep peaks.
+    """
+    h_max = int(heightmap.max())
+    # Only inspect cells that are meaningfully high — near the global maximum.
+    # Use drop_threshold as the margin: anything within drop_threshold blocks
+    # of h_max is a candidate.
+    candidate = heightmap >= (h_max - drop_threshold)
+
+    t0 = time.perf_counter()
+    print(f"    Labeling high-altitude components (≥ Y={h_max - drop_threshold}) …",
+          end=" ", flush=True)
+    labeled, n = label(candidate)
+    print(f"{n:,} components  ({time.perf_counter()-t0:.1f}s)")
+
+    if n == 0:
+        return heightmap
+
+    result = heightmap.copy()
+    n_removed = 0
+
+    for cid in range(1, n + 1):
+        comp = labeled == cid
+        comp_min_h = int(heightmap[comp].min())
+
+        # Border = cells immediately adjacent but outside the component
+        border = binary_dilation(comp) & ~comp
+
+        if not border.any():
+            # Component touches map edge — treat as grounded
+            continue
+
+        max_border_h = int(heightmap[border].max())
+
+        # Floating if component hangs more than drop_threshold above all neighbors
+        if comp_min_h - max_border_h > drop_threshold:
+            result[comp] = max_border_h
+            n_removed += 1
+
+    print(f"    Removed {n_removed} floating cluster(s) of {n} high-altitude "
+          f"component(s)  (drop > {drop_threshold} blocks above all neighbors)")
+    return result
 
 
 def apply_ocean_mask(

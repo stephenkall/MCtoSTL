@@ -84,8 +84,9 @@ def _parse_worker(args: Tuple) -> Tuple[str, Dict]:
     Worker entry point.  Runs in a subprocess.
     Returns (filepath, chunks_dict) so the caller can identify the result.
     """
-    filepath, debug, ground_only = args
-    chunks = parse_region(filepath, debug=debug, ground_only=ground_only)
+    filepath, debug, ground_only, detect_floating = args
+    chunks = parse_region(filepath, debug=debug, ground_only=ground_only,
+                          detect_floating=detect_floating)
     return filepath, chunks
 
 
@@ -98,6 +99,7 @@ def load_save(
     ground_only: bool = False,
     use_cache: bool = True,
     n_workers: int = 0,
+    detect_floating: bool = False,
 ) -> Tuple[np.ndarray, Dict]:
     """
     Load all region files from a Minecraft save.
@@ -149,7 +151,7 @@ def load_save(
     # ── Parse uncached files in parallel ──────────────────────────────────
     if to_parse:
         print(f"  Parsing {len(to_parse)} region file(s) with {n_workers} worker(s) …")
-        args_list = [(fp, debug, ground_only) for fp in to_parse]
+        args_list = [(fp, debug, ground_only, detect_floating) for fp in to_parse]
 
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_parse_worker, a): a[0] for a in args_list}
