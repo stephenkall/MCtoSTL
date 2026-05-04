@@ -38,6 +38,7 @@ def detect_save_format(save_path: str) -> str:
     # Java: has region/ subfolder with at least one .mca file
     for candidate in [
         os.path.join(save_path, "region"),
+        os.path.join(save_path, "dimensions", "minecraft", "overworld", "region"),
         os.path.join(save_path, "DIM0", "region"),
         os.path.join(save_path, "world", "region"),
     ]:
@@ -64,15 +65,18 @@ def detect_save_format(save_path: str) -> str:
 def find_region_dir(save_path: str) -> str:
     candidates = [
         os.path.join(save_path, "region"),
+        os.path.join(save_path, "dimensions", "minecraft", "overworld", "region"),
         os.path.join(save_path, "DIM0", "region"),
         os.path.join(save_path, "world", "region"),
     ]
     for path in candidates:
-        if os.path.isdir(path):
+        if os.path.isdir(path) and glob.glob(os.path.join(path, "r.*.*.mca")):
             return path
     raise FileNotFoundError(
-        f"No 'region' folder found in '{save_path}'.\n"
-        "Expected: <save>/region/r.X.Z.mca"
+        f"No region folder with .mca files found in '{save_path}'.\n"
+        "Expected one of:\n"
+        "  <save>/region/r.X.Z.mca  (classic format)\n"
+        "  <save>/dimensions/minecraft/overworld/region/r.X.Z.mca  (post-1.21 format)"
     )
 
 
