@@ -152,22 +152,33 @@ def generate_single_stl(
     output_path: str,
     max_vertices: int = 2000,
     ocean_mask: Optional[np.ndarray] = None,
+    sea_level: Optional[float] = None,
+    sea_level_offset: int = 0,
 ) -> None:
-    """Generate one watertight STL for the entire terrain."""
+    """Generate one watertight STL for the entire terrain.
+
+    When sea_level_offset > 0, ocean cells are set to (sea_level - offset),
+    all terrain is clamped to that floor, and the STL Z=0 plane sits at that
+    depth — producing a basin that can be filled with resin up to sea level.
+    """
     print(f"\n[Single STL]")
 
     sm = gaussian_filter(heightmap.astype(np.float32), sigma=smooth_sigma)
     sm = downsample(sm, max_vertices)
     rows, cols = sm.shape
 
-    # Flatten ocean cells to global minimum so they print as base plate only,
-    # not as a raised flat sea-level surface.
     if ocean_mask is not None:
         om_small = zoom(ocean_mask.astype(np.float32),
                         (rows / heightmap.shape[0], cols / heightmap.shape[1]),
                         order=0) > 0.5
-        sm[om_small] = float(sm.min())
+        if sea_level is not None and sea_level_offset > 0:
+            stl_zero = float(sea_level - sea_level_offset)
+            sm[om_small] = stl_zero
+            sm = np.maximum(sm, stl_zero)
+        else:
+            sm[om_small] = float(sm.min())
 
+    h_min_global = float(sm.min())
     h_range = float(sm.max() - sm.min())
     if h_range < 1e-6:
         h_range = 1.0
@@ -183,6 +194,9 @@ def generate_single_stl(
     print(f"  Mesh        : {cols} × {rows} vertices")
     print(f"  XY scale    : {xy_scale:.4f} mm/vertex  (aspect preserved)")
     print(f"  Z scale     : {z_scale:.4f} mm/unit  (range {h_range:.0f})")
+    if sea_level_offset > 0:
+        basin_mm = sea_level_offset * z_scale
+        print(f"  Ocean basin : {basin_mm:.1f} mm deep  (fill with resin to sea surface)")
     print(f"  Dimensions  : {actual_x:.1f} × {actual_y:.1f} × "
           f"{h_range*z_scale + base_mm:.1f} mm")
     print(f"  Triangles   : {n_tris:,}  (~{size_mb:.0f} MB)")
@@ -190,7 +204,7 @@ def generate_single_stl(
     gen = _iter_solid(
         sm, xy_scale, z_scale, base_mm,
         origin_x=0.0, origin_y=0.0,
-        h_min_global=float(sm.min()),
+        h_min_global=h_min_global,
     )
 
     with StreamingSTL(output_path, n_tris) as stl:
@@ -217,6 +231,8 @@ def generate_mosaic_stl(
     existing_tiles: Optional[Set[Tuple[int, int]]] = None,
     ocean_mask: Optional[np.ndarray] = None,
     skip_ocean: bool = False,
+    sea_level: Optional[float] = None,
+    sea_level_offset: int = 0,
 ) -> None:
     """
     Generate a mosaic of tiled STL files.
@@ -225,6 +241,8 @@ def generate_mosaic_stl(
     ocean_mask     : boolean array matching heightmap; used to skip ocean tiles
                      when skip_ocean=True.
     All tiles share the same h_min_global so Z heights are consistent.
+    When sea_level_offset > 0, ocean cells form a basin of that depth (in
+    blocks), enabling a resin fill up to sea level on the physical model.
     """
     print(f"\n[Mosaic STLs]")
 
@@ -232,15 +250,17 @@ def generate_mosaic_stl(
     sm = downsample(sm, max_vertices)
     rows, cols = sm.shape
 
-    # Downsample ocean mask to match sm whenever provided.
-    # Flatten ocean cells to global minimum so they print as base plate only —
-    # the coastline ends at the shore rather than extending as a flat sea plate.
     om_small: Optional[np.ndarray] = None
     if ocean_mask is not None:
         om_small = zoom(ocean_mask.astype(np.float32),
                         (rows / heightmap.shape[0], cols / heightmap.shape[1]),
                         order=0) > 0.5
-        sm[om_small] = float(sm.min())
+        if sea_level is not None and sea_level_offset > 0:
+            stl_zero = float(sea_level - sea_level_offset)
+            sm[om_small] = stl_zero
+            sm = np.maximum(sm, stl_zero)
+        else:
+            sm[om_small] = float(sm.min())
 
     h_min_global = float(sm.min())
     h_range = float(sm.max() - sm.min())

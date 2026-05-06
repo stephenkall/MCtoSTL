@@ -31,7 +31,8 @@ from mc_to_stl.loader import load_save, diagnose_save, detect_save_format
 from mc_to_stl.image import generate_image
 from mc_to_stl.mesh import generate_single_stl, generate_mosaic_stl
 from mc_to_stl.ocean import (
-    detect_sea_level, build_ocean_mask, remove_micro_islands, apply_ocean_mask,
+    detect_sea_level, build_ocean_mask, remove_micro_islands,
+    apply_ocean_mask, apply_polygon_masks,
 )
 
 
@@ -193,6 +194,13 @@ def collect_params(saved: Dict = None) -> Dict:
             d("min_land_area", 2_000), mn=0,
         )
 
+    print("  Polygon masks: JSON file with areas to force to sea level (e.g. NPC")
+    print("  villages, lakes, custom bays). Format: [{\"coordinates\":[[x,z],...]}]")
+    polygon_json = _ask_str(
+        "Polygon mask JSON file path (leave blank to skip)",
+        d("polygon_json", ""),
+    )
+
     # ── Java-only: floating block removal ────────────────────────────────
     if not is_bedrock:
         _sec("Floating Block Removal  (Java Edition)")
@@ -223,6 +231,12 @@ def collect_params(saved: Dict = None) -> Dict:
     max_y_mm  = _ask_float("Max Y  (mm)", d("max_y_mm", 200.0))
     max_z_mm  = _ask_float("Max Z  (altitude, mm)", d("max_z_mm", 30.0))
     base_mm   = _ask_float("Base plate thickness (mm)", d("base_mm", 2.0))
+    print("  Ocean basin: set N > 0 to carve the ocean N blocks deep below sea level.")
+    print("  The resin top surface will sit flush with sea level on the printed model.")
+    sea_level_offset = _ask_int(
+        "Ocean basin depth (blocks below sea level, 0 = flat ocean)",
+        d("sea_level_offset", 0), mn=0,
+    )
 
     _sec("STL Mesh Resolution")
     print("  Max vertices on the longest side.  Higher = more detail but larger file.")
@@ -249,11 +263,13 @@ def collect_params(saved: Dict = None) -> Dict:
         sea_level=sea_level,
         min_ocean_blocks=min_ocean_blocks,
         min_land_area=min_land_area,
+        polygon_json=polygon_json,
         detect_floating=detect_floating,
         max_px_w=max_px_w, max_px_h=max_px_h,
         gamma=gamma,
         max_x_mm=max_x_mm, max_y_mm=max_y_mm, max_z_mm=max_z_mm,
         base_mm=base_mm,
+        sea_level_offset=sea_level_offset,
         max_verts=max_verts,
         tile_x_mm=tile_x_mm, tile_y_mm=tile_y_mm,
         skip_ocean_stl=skip_ocean_stl,
@@ -289,13 +305,17 @@ def stage_load(cp: Checkpoint, params: Dict):
         sys.exit(1)
 
     print(f"  Height range: Y={hm.min():.0f} .. Y={hm.max():.0f}")
+    # Store world origin so polygon masks can convert block coords → pixels
+    params["_min_cx"] = int(meta.get("min_cx", 0))
+    params["_min_cz"] = int(meta.get("min_cz", 0))
+    cp.set_params(params)
     cp.save_raw_heightmap(hm)
     cp.cleanup_after_load()   # chunk cache no longer needed
     return hm
 
 
 def stage_process(cp: Checkpoint, params: Dict, hm_raw):
-    """Apply ocean masking and island filtering."""
+    """Apply ocean masking, island filtering, and polygon masks."""
     if cp.is_done("processed"):
         print("\n[Resume] Loading cached processed heightmap …")
         hm_work, ocean_mask = cp.load_work_heightmap()
@@ -305,16 +325,19 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
 
     _sec("Processing Heightmap")
 
-    if not params["mask_ocean"]:
+    polygon_json = params.get("polygon_json", "")
+    has_polygons = bool(polygon_json and os.path.isfile(polygon_json))
+
+    # Early exit only when there is truly nothing to do
+    if not params["mask_ocean"] and not has_polygons:
         cp.save_work_heightmap(hm_raw, None)
         return hm_raw, None
 
-    # Auto-detect sea level if user left it as None
+    # Resolve sea level (needed for ocean mask and/or polygon masks)
     sea_level = params["sea_level"]
     if sea_level is None:
         sea_level = detect_sea_level(hm_raw)
         print(f"  Auto-detected sea level: Y={sea_level}")
-        # Persist for resume
         params["sea_level"] = sea_level
         cp.set_params(params)
 
@@ -322,29 +345,47 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
     print(f"  Map size : {hm_raw.shape[1]:,} × {hm_raw.shape[0]:,} blocks "
           f"({hm_raw.size:,} total)")
 
-    print(f"\n  [Ocean mask]")
-    t0 = time.perf_counter()
-    ocean_mask = build_ocean_mask(
-        hm_raw,
-        sea_level=sea_level,
-        min_ocean_blocks=params["min_ocean_blocks"],
-    )
-    pct = 100.0 * ocean_mask.sum() / ocean_mask.size
-    print(f"    → {pct:.1f}% ocean  ({time.perf_counter()-t0:.1f}s total)")
+    ocean_mask = None
 
-    if params["min_land_area"] > 0:
-        print(f"\n  [Micro-island filter]")
-        t1 = time.perf_counter()
-        before = int(ocean_mask.sum())
-        ocean_mask = remove_micro_islands(
-            hm_raw, ocean_mask,
+    if params["mask_ocean"]:
+        print(f"\n  [Ocean mask]")
+        t0 = time.perf_counter()
+        ocean_mask = build_ocean_mask(
+            hm_raw,
             sea_level=sea_level,
-            min_land_area=params["min_land_area"],
+            min_ocean_blocks=params["min_ocean_blocks"],
         )
-        removed = int(ocean_mask.sum()) - before
-        print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
+        pct = 100.0 * ocean_mask.sum() / ocean_mask.size
+        print(f"    → {pct:.1f}% ocean  ({time.perf_counter()-t0:.1f}s total)")
 
-    hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=sea_level)
+        if params["min_land_area"] > 0:
+            print(f"\n  [Micro-island filter]")
+            t1 = time.perf_counter()
+            before = int(ocean_mask.sum())
+            ocean_mask = remove_micro_islands(
+                hm_raw, ocean_mask,
+                sea_level=sea_level,
+                min_land_area=params["min_land_area"],
+            )
+            removed = int(ocean_mask.sum()) - before
+            print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
+
+        hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=sea_level)
+    else:
+        hm_work = hm_raw.copy()
+
+    if has_polygons:
+        import json as _json
+        print(f"\n  [Polygon masks]")
+        with open(polygon_json, encoding="utf-8") as f:
+            polygons = _json.load(f)
+        world_origin = (
+            params.get("_min_cx", 0) * 16,
+            params.get("_min_cz", 0) * 16,
+        )
+        hm_work, ocean_mask = apply_polygon_masks(
+            hm_work, ocean_mask, polygons, sea_level, world_origin,
+        )
 
     cp.save_work_heightmap(hm_work, ocean_mask)
     cp.cleanup_after_process()   # raw heightmap no longer needed
@@ -380,6 +421,8 @@ def stage_stl(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         params["base_mm"], params["smooth_sigma"], stl_path,
         max_vertices=params["max_verts"],
         ocean_mask=ocean_mask,
+        sea_level=params.get("sea_level"),
+        sea_level_offset=params.get("sea_level_offset", 0),
     )
     cp.mark_done("stl")
 
@@ -399,6 +442,8 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         existing_tiles=existing,
         ocean_mask=ocean_mask,
         skip_ocean=params.get("skip_ocean_stl", False),
+        sea_level=params.get("sea_level"),
+        sea_level_offset=params.get("sea_level_offset", 0),
     )
     cp.mark_done("mosaic")
 
