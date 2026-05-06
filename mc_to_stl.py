@@ -16,6 +16,7 @@ Flags:
   --fresh         ignore any saved checkpoint and start over
 """
 
+import json
 import os
 import sys
 import time
@@ -127,19 +128,17 @@ def collect_params(saved: Dict = None) -> Dict:
     _sec("Output")
     out_dir = _ask_path("Output directory", default=d("out_dir", "mc_output"))
 
-    if saved is None:
-        _cp_path = os.path.join(out_dir, ".checkpoint.json")
-        if os.path.exists(_cp_path):
-            try:
-                import json as _json
-                with open(_cp_path, encoding="utf-8") as _f:
-                    _cp_data = _json.load(_f)
-                _cp_params = _cp_data.get("params") or _cp_data
-                if _cp_params.get("save_path") == save_path:
-                    if _ask_bool("Checkpoint found - resume from where you left off?", default=True):
-                        p = _cp_params
-            except Exception:
-                pass
+    _cp_path = os.path.join(out_dir, ".checkpoint.json")
+    if os.path.exists(_cp_path):
+        try:
+            with open(_cp_path, encoding="utf-8") as _f:
+                _cp_data = json.load(_f)
+            _cp_params = _cp_data.get("params") or _cp_data
+            if _cp_params.get("save_path") == save_path:
+                if _ask_bool("Checkpoint found - resume from where you left off?", default=True):
+                    p = _cp_params
+        except Exception:
+            pass
 
     # ── Java-only: parallelism ────────────────────────────────────────────
     if not is_bedrock:
@@ -231,10 +230,11 @@ def collect_params(saved: Dict = None) -> Dict:
     max_y_mm  = _ask_float("Max Y  (mm)", d("max_y_mm", 200.0))
     max_z_mm  = _ask_float("Max Z  (altitude, mm)", d("max_z_mm", 30.0))
     base_mm   = _ask_float("Base plate thickness (mm)", d("base_mm", 2.0))
-    print("  Ocean basin: set N > 0 to carve the ocean N blocks deep below sea level.")
-    print("  The resin top surface will sit flush with sea level on the printed model.")
+    print("  Sea level drain: pretend the sea is N blocks lower than it really is.")
+    print("  Shallow seafloor exposed this way prints as terrain; deep ocean stays flat.")
+    print("  Fill the printed ocean basin with resin — its surface = the real sea level.")
     sea_level_offset = _ask_int(
-        "Ocean basin depth (blocks below sea level, 0 = flat ocean)",
+        "Sea level drain (blocks, 0 = use actual sea level)",
         d("sea_level_offset", 0), mn=0,
     )
 
@@ -341,7 +341,16 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         params["sea_level"] = sea_level
         cp.set_params(params)
 
-    print(f"  Sea level: Y={sea_level}")
+    # effective_sea_level lowers the ocean threshold so the continental shelf
+    # is exposed as terrain; ocean cells are flattened to effective_sea_level
+    # (the resin basin depth = offset * z_scale mm).
+    sea_level_offset = int(params.get("sea_level_offset", 0))
+    effective_sea_level = sea_level - sea_level_offset
+
+    if sea_level_offset > 0:
+        print(f"  Sea level: Y={sea_level}  (draining {sea_level_offset} blocks → effective Y={effective_sea_level})")
+    else:
+        print(f"  Sea level: Y={sea_level}")
     print(f"  Map size : {hm_raw.shape[1]:,} × {hm_raw.shape[0]:,} blocks "
           f"({hm_raw.size:,} total)")
 
@@ -352,7 +361,7 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         t0 = time.perf_counter()
         ocean_mask = build_ocean_mask(
             hm_raw,
-            sea_level=sea_level,
+            sea_level=effective_sea_level,
             min_ocean_blocks=params["min_ocean_blocks"],
         )
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
@@ -364,15 +373,19 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
             before = int(ocean_mask.sum())
             ocean_mask = remove_micro_islands(
                 hm_raw, ocean_mask,
-                sea_level=sea_level,
+                sea_level=effective_sea_level,
                 min_land_area=params["min_land_area"],
             )
             removed = int(ocean_mask.sum()) - before
             print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
 
-        hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=sea_level)
+        hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=effective_sea_level)
     else:
         hm_work = hm_raw.copy()
+
+    # Save effective_sea_level so stage_image can use it for colour mapping
+    params["_effective_sea_level"] = effective_sea_level
+    cp.set_params(params)
 
     if has_polygons:
         import json as _json
@@ -397,13 +410,14 @@ def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         print("\n[Resume] Heightmap image already done — skipping.")
         return
     _sec("Heightmap Image")
-    sea_level = params.get("sea_level") or 0.0
+    # Use effective_sea_level for colour reference (0 = green on the gradient)
+    eff_sl = params.get("_effective_sea_level") or params.get("sea_level") or 0.0
     img_path = os.path.join(params["out_dir"], "heightmap.png")
     generate_image(
         hm_work,
         params["max_px_w"], params["max_px_h"],
         params["smooth_sigma"], img_path,
-        sea_level=float(sea_level),
+        sea_level=float(eff_sl),
         ocean_mask=ocean_mask,
         gamma=params["gamma"],
     )
@@ -421,8 +435,6 @@ def stage_stl(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         params["base_mm"], params["smooth_sigma"], stl_path,
         max_vertices=params["max_verts"],
         ocean_mask=ocean_mask,
-        sea_level=params.get("sea_level"),
-        sea_level_offset=params.get("sea_level_offset", 0),
     )
     cp.mark_done("stl")
 
@@ -442,8 +454,6 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         existing_tiles=existing,
         ocean_mask=ocean_mask,
         skip_ocean=params.get("skip_ocean_stl", False),
-        sea_level=params.get("sea_level"),
-        sea_level_offset=params.get("sea_level_offset", 0),
     )
     cp.mark_done("mosaic")
 
@@ -465,10 +475,30 @@ def main() -> None:
         diagnose_save(save)
         return
 
+    # ── Optional: pre-fill prompts from a saved config file ──────────────
+    saved_config = None
+    _sec("Configuration File")
+    _cfg_raw = input("  Load answers from a config file? (path or blank to skip): ").strip()
+    if _cfg_raw:
+        _cfg_path = os.path.expanduser(_cfg_raw)
+        if os.path.isfile(_cfg_path):
+            with open(_cfg_path, encoding="utf-8") as _f:
+                saved_config = json.load(_f)
+            print(f"  Loaded: {_cfg_path}")
+        else:
+            print(f"  File not found: {_cfg_path} — starting fresh.")
+
     # ── Collect all parameters ────────────────────────────────────────────
-    params = collect_params()
+    params = collect_params(saved=saved_config)
     out_dir = params["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
+
+    # ── Save config for future runs ───────────────────────────────────────
+    _cfg_out = os.path.join(out_dir, "config.json")
+    _cfg_data = {k: v for k, v in params.items() if not k.startswith("_") and k != "timestamp"}
+    with open(_cfg_out, "w", encoding="utf-8") as _f:
+        json.dump(_cfg_data, _f, indent=2, ensure_ascii=False)
+    print(f"\n  Config saved → {_cfg_out}")
 
     # ── Initialise / load checkpoint ──────────────────────────────────────
     cp = Checkpoint(out_dir)
