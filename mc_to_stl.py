@@ -244,6 +244,37 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
     else:
         detect_floating = False
 
+    # ── Java-only: force section scan ────────────────────────────────────
+    if not is_bedrock:
+        _sec("Stale Heightmap Fix  (Java Edition)")
+        print("  force_scan = YES  →  always scan block sections, ignore stored Heightmaps.")
+        print("  Use when you see holes in mountains that don't appear in Unmined.")
+        print("  Matches what Unmined does; ~2-3x slower per chunk. Disables chunk cache.")
+        force_scan = _ask_bool("Force section scan (fix stale heightmaps)?",
+                               default=d("force_scan", False))
+    else:
+        force_scan = False
+
+    # ── Crop region ───────────────────────────────────────────────────────
+    _sec("Crop Region  (optional)")
+    print("  Define a 4-corner quadrilateral in Minecraft block coords (X, Z).")
+    print("  Only blocks inside this polygon appear in the output.")
+    _has_crop = d("crop_x1", None) is not None
+    enable_crop = _ask_bool("Crop to a quadrilateral region?", default=_has_crop)
+    if enable_crop:
+        print("  Enter block coordinates for the 4 corners (can be negative).")
+        crop_x1 = _ask("Corner 1 X", d("crop_x1", 0), int)
+        crop_z1 = _ask("Corner 1 Z", d("crop_z1", 0), int)
+        crop_x2 = _ask("Corner 2 X", d("crop_x2", 0), int)
+        crop_z2 = _ask("Corner 2 Z", d("crop_z2", 0), int)
+        crop_x3 = _ask("Corner 3 X", d("crop_x3", 0), int)
+        crop_z3 = _ask("Corner 3 Z", d("crop_z3", 0), int)
+        crop_x4 = _ask("Corner 4 X", d("crop_x4", 0), int)
+        crop_z4 = _ask("Corner 4 Z", d("crop_z4", 0), int)
+    else:
+        crop_x1 = crop_z1 = crop_x2 = crop_z2 = None
+        crop_x3 = crop_z3 = crop_x4 = crop_z4 = None
+
     _sec("Output Stages")
     generate_heightmap = _ask_bool("Generate heightmap images?", default=d("generate_heightmap", True))
     generate_stl = _ask_bool("Generate single STL?", default=d("generate_stl", True))
@@ -300,6 +331,11 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         min_land_area=min_land_area,
         polygon_json=polygon_json,
         detect_floating=detect_floating,
+        force_scan=force_scan,
+        crop_x1=crop_x1, crop_z1=crop_z1,
+        crop_x2=crop_x2, crop_z2=crop_z2,
+        crop_x3=crop_x3, crop_z3=crop_z3,
+        crop_x4=crop_x4, crop_z4=crop_z4,
         generate_heightmap=generate_heightmap,
         generate_stl=generate_stl,
         generate_mosaic=generate_mosaic,
@@ -347,7 +383,9 @@ def _invalidate_stale_stages(cp: Checkpoint, params: Dict) -> None:
     def changed(keys):
         return any(not _val_eq(old.get(k), params.get(k)) for k in keys)
 
-    LOAD_KEYS   = {"save_path", "ground_only", "detect_floating"}
+    LOAD_KEYS   = {"save_path", "ground_only", "detect_floating", "force_scan",
+                   "crop_x1", "crop_z1", "crop_x2", "crop_z2",
+                   "crop_x3", "crop_z3", "crop_x4", "crop_z4"}
     PROC_KEYS   = {"mask_ocean", "sea_level", "sea_level_offset",
                    "min_ocean_blocks", "min_land_area", "polygon_json"}
     IMG_KEYS    = {"smooth_sigma", "gamma", "max_px_w", "max_px_h"}
@@ -403,6 +441,14 @@ def stage_load(cp: Checkpoint, params: Dict):
         print("  Cache missing — re-loading from save.")
 
     _sec("Loading Save")
+    crop_poly = None
+    if params.get("crop_x1") is not None:
+        crop_poly = [
+            [params["crop_x1"], params["crop_z1"]],
+            [params["crop_x2"], params["crop_z2"]],
+            [params["crop_x3"], params["crop_z3"]],
+            [params["crop_x4"], params["crop_z4"]],
+        ]
     try:
         hm, meta = load_save(
             params["save_path"],
@@ -411,6 +457,8 @@ def stage_load(cp: Checkpoint, params: Dict):
             use_cache=True,
             n_workers=params.get("n_workers", 0),
             detect_floating=params.get("detect_floating", False),
+            force_scan=params.get("force_scan", False),
+            crop_poly=crop_poly,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"\n  ✗  {exc}")

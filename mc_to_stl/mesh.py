@@ -162,11 +162,18 @@ def generate_single_stl(
 
     # Flatten ocean cells to global minimum so they print as base plate only,
     # not as a raised flat sea-level surface.
+    om_small = None
     if ocean_mask is not None:
         om_small = zoom(ocean_mask.astype(np.float32),
                         (rows / heightmap.shape[0], cols / heightmap.shape[1]),
                         order=0) > 0.5
         sm[om_small] = float(sm.min())
+
+    # Flip north-south so north (row 0) maps to Y=max (back of print bed),
+    # matching the map image orientation (north = top = far side).
+    sm = sm[::-1, :]
+    if om_small is not None:
+        om_small = om_small[::-1, :]
 
     h_range = float(sm.max() - sm.min())
     if h_range < 1e-6:
@@ -241,6 +248,11 @@ def generate_mosaic_stl(
                         (rows / heightmap.shape[0], cols / heightmap.shape[1]),
                         order=0) > 0.5
         sm[om_small] = float(sm.min())
+
+    # Flip north-south so north (row 0) maps to Y=max (back of print bed).
+    sm = sm[::-1, :]
+    if om_small is not None:
+        om_small = om_small[::-1, :]
 
     h_min_global = float(sm.min())
     h_range = float(sm.max() - sm.min())

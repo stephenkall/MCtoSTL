@@ -355,6 +355,7 @@ def _extract_heightmap(
     root: nbtlib.Compound,
     ground_only: bool = False,
     detect_floating: bool = False,
+    force_scan: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Extract a 16×16 int32 heightmap from a parsed chunk Compound.
@@ -364,11 +365,16 @@ def _extract_heightmap(
                           skips plants, wood, and decorative blocks
     detect_floating=True: always use section-based 3D connectivity analysis
                           (bypasses Heightmaps compound) to exclude floating blocks
+    force_scan=True:      always scan block sections, ignore stored Heightmaps.
+                          Use when the stored heightmap is stale (e.g. terrain was
+                          raised after the chunk was first generated in an older
+                          version).  Slower than reading stored values but matches
+                          what Unmined does.
     """
     chunk = root.get("Level", root)
 
-    # 3D floating-block detection requires section data — bypass stored heightmaps.
-    if not detect_floating:
+    # 3D floating-block detection and force_scan both require section data.
+    if not detect_floating and not force_scan:
         hm_keys = _HM_KEYS_GROUND if ground_only else _HM_KEYS_SURFACE
 
         # 1 ── New format: Heightmaps compound (1.13+) ────────────────────
@@ -403,6 +409,7 @@ def parse_region(
     debug: bool = False,
     ground_only: bool = False,
     detect_floating: bool = False,
+    force_scan: bool = False,
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """
     Parse a single .mca file.
@@ -464,7 +471,8 @@ def parse_region(
                 continue
 
             hm = _extract_heightmap(root, ground_only=ground_only,
-                                     detect_floating=detect_floating)
+                                     detect_floating=detect_floating,
+                                     force_scan=force_scan)
             if hm is None:
                 if debug:
                     chunk = root.get("Level", root)

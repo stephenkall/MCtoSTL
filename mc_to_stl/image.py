@@ -105,22 +105,20 @@ def generate_image(
     print(f"  Output size  : {out_w} x {out_h} px")
 
     # ── Stats (on original full-res data to be accurate) ─────────────────
+    lo = float(heightmap.min())
+    hi = float(heightmap.max())
+    if hi <= lo:
+        hi = lo + 1.0
     land_mask = (~ocean_mask) if ocean_mask is not None else np.ones((rows, cols), dtype=bool)
     land = heightmap[land_mask]
     if land.size > 0:
-        lo = float(np.percentile(land, 2))
-        hi = float(np.percentile(land, 98))
         land_rel = land - sea_level
         rel_min = float(land_rel.min())
         rel_max = float(land_rel.max())
     else:
-        lo = float(heightmap.min())
-        hi = float(heightmap.max())
         rel_min = rel_max = 0.0
-    if hi <= lo:
-        hi = lo + 1.0
     print(f"  Land range   : {rel_min:+.0f} .. {rel_max:+.0f}  (relative to sea)")
-    print(f"  Gray stretch : Y={lo:.0f} → black,  Y={hi:.0f} → white  (2nd–98th pct)")
+    print(f"  Gray stretch : Y={lo:.0f} → black,  Y={hi:.0f} → white  (global min–max)")
     if ocean_mask is not None:
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
         print(f"  Ocean cover  : {pct:.1f}%")
