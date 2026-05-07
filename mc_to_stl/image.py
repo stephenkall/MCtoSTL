@@ -141,6 +141,10 @@ def generate_image(
         else:
             om_small = None
         print(f"done  ({sm.shape[1]} × {sm.shape[0]} px)")
+        if om_small is not None:
+            print(f"  [debug] om_small coverage after downsample: {100.0*om_small.sum()/om_small.size:.1f}%")
+        else:
+            print(f"  [debug] om_small is None after downsample")
     else:
         sm = heightmap.astype(np.float32)
         om_small = ocean_mask

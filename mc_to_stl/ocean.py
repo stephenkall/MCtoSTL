@@ -289,6 +289,10 @@ def apply_polygon_masks(
 
         # Minecraft (x, z) → heightmap (row, col):  row = z − origin_z, col = x − origin_x
         pts = np.array([[c[1] - origin_z, c[0] - origin_x] for c in coords], dtype=float)
+        print(f"      Coords sample (first 3): {coords[:3]}")
+        print(f"      Pixel bbox raw: row {pts[:,0].min():.0f}..{pts[:,0].max():.0f}, "
+              f"col {pts[:,1].min():.0f}..{pts[:,1].max():.0f}  "
+              f"(map is {rows}×{cols})")
 
         try:
             hull = ConvexHull(pts)
@@ -300,6 +304,7 @@ def apply_polygon_masks(
         r_max = min(rows - 1, int(pts[:, 0].max()))
         c_min = max(0, int(pts[:, 1].min()))
         c_max = min(cols - 1, int(pts[:, 1].max()))
+        print(f"      Pixel bbox clamped: rows {r_min}..{r_max}, cols {c_min}..{c_max}")
 
         if r_max < r_min or c_max < c_min:
             print(f"    Warning: polygon entirely outside heightmap bounds — skipped.")
