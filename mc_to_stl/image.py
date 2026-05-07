@@ -1,35 +1,37 @@
 """
-Heightmap → PNG image matching Unmined's heightmap rendering style.
+Heightmap → PNG image.
 
-Color scheme:
-  land  → grayscale by elevation (darker = lower, lighter = higher)
-  ocean → steel-blue  (#1E50A0)
+Color scheme (heightmap.png)
+-----------------------------
+  below sea level  → dark blue → sea-green gradient
+  at sea level     → sea-green  (#14A037)
+  above sea level  → sea-green → red gradient
+  ocean cells      → steel-blue (#1E50A0) override
 
-No hillshading is applied — each gray value maps directly to one elevation,
-making the image useful as a working reference.
+Grayscale (heightmap_gray.png)
+-------------------------------
+  Pure grayscale: global min → black, global max → white.
+  Ocean cells set to black (Y = 0).
 
-Grayscale normalisation
------------------------
-Land heights are percentile-stretched to [2nd, 98th] so isolated peaks or
-deep valleys don't collapse the gradient for the majority of the terrain.
-Both the color PNG and the gray PNG use the same stretch parameters.
+Transparent crop (rectangular_crop=False)
+------------------------------------------
+  When a crop_mask is provided and rectangular_crop is False, both PNG
+  files are saved as RGBA with alpha=0 for pixels outside the crop polygon
+  and alpha=255 inside.  The bounding-box dimensions are unchanged.
+
+Normalisation
+--------------
+Strict global min→black, global max→white (no percentile clipping).
 
 Output dimensions
------------------
-The image is always produced at exactly (out_w × out_h) pixels.  If the map
-is smaller than max_px, it is upscaled so that every block maps to >1 pixel.
-Set max_px_w = max_px_h = 0 to keep the native 1 block = 1 pixel resolution.
+------------------
+Always produced at exactly (out_w × out_h) pixels.  Set max_px_w =
+max_px_h = 0 to keep native 1 block = 1 pixel resolution.
 
 Outlier suppression
--------------------
-Before rendering a 3×3 median filter is applied to the FULL-resolution
-heightmap to eliminate single-pixel terrain anomalies (cave mouths, ravines,
-isolated missing-chunk holes) that would otherwise appear as dark specks.
-
-Memory model
-------------
-After the median filter the heightmap is immediately downsampled to the
-output pixel dimensions so that all subsequent arrays are output-sized.
+--------------------
+Before rendering a 3×3 median filter is applied at full resolution to
+eliminate single-pixel terrain anomalies.
 """
 
 import os
@@ -39,35 +41,78 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter, median_filter, zoom
 
-_OCEAN_RGB = np.array([30, 80, 160], dtype=np.uint8)
+_OCEAN_RGB  = np.array([30, 80, 160],   dtype=np.float64)
+_C_DEEP     = np.array([0,  30,  80],   dtype=np.float64)  # deep below sea level
+_C_SEA      = np.array([20, 160, 60],   dtype=np.float64)  # sea level (green)
+_C_HIGH     = np.array([200, 30,  30],  dtype=np.float64)  # max altitude (red)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _lerp_colors(c0: np.ndarray, c1: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Interpolate between two RGB float64 colors. t: 1-D float array → (N,3) uint8."""
+    return np.clip(c0 * (1 - t[:, None]) + c1 * t[:, None], 0, 255).astype(np.uint8)
+
 
 def _build_rgb(
     sm: np.ndarray,
     ocean_mask: Optional[np.ndarray],
     lo: float,
     hi: float,
+    sea_level: float,
 ) -> np.ndarray:
     """
-    Build uint8 RGB: grayscale land (percentile-normalised) + steel-blue ocean.
-    lo/hi are the land-height percentile bounds computed from the full-res data.
+    Build uint8 RGB array using elevation-based color scheme.
+
+    Below sea level → dark-blue-to-green gradient.
+    Above sea level → green-to-red gradient.
+    Ocean cells     → steel-blue override.
     """
     rows, cols = sm.shape
     out = np.zeros((rows, cols, 3), dtype=np.uint8)
 
-    gray_f = np.clip((sm - lo) / (hi - lo), 0.0, 1.0)
-    gray_u8 = (gray_f * 255).astype(np.uint8)
+    sea = float(np.clip(sea_level, lo, hi))
 
-    out[..., 0] = gray_u8
-    out[..., 1] = gray_u8
-    out[..., 2] = gray_u8
+    # Below sea level
+    below = sm < sea
+    if below.any():
+        denom = max(sea - lo, 1e-6)
+        t = np.clip((sm[below] - lo) / denom, 0.0, 1.0)
+        out[below] = _lerp_colors(_C_DEEP, _C_SEA, t)
 
+    # At / above sea level
+    above = ~below
+    if above.any():
+        denom = max(hi - sea, 1e-6)
+        t = np.clip((sm[above] - sea) / denom, 0.0, 1.0)
+        out[above] = _lerp_colors(_C_SEA, _C_HIGH, t)
+
+    # Ocean override
     if ocean_mask is not None and ocean_mask.any():
-        out[ocean_mask] = _OCEAN_RGB
+        out[ocean_mask] = _OCEAN_RGB.astype(np.uint8)
 
     return out
+
+
+def _apply_alpha(
+    arr: np.ndarray,
+    crop_mask_small: Optional[np.ndarray],
+) -> Image.Image:
+    """
+    Convert RGB or grayscale array to PIL Image, adding alpha channel from
+    crop_mask_small when provided (inside=255, outside=0).
+    """
+    if crop_mask_small is None:
+        if arr.ndim == 2:
+            return Image.fromarray(arr, "L")
+        return Image.fromarray(arr, "RGB")
+
+    alpha = np.where(crop_mask_small, np.uint8(255), np.uint8(0))
+    if arr.ndim == 2:
+        rgba = np.dstack([arr, arr, arr, alpha])
+    else:
+        rgba = np.dstack([arr, alpha])
+    return Image.fromarray(rgba.astype(np.uint8), "RGBA")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -80,15 +125,22 @@ def generate_image(
     output_path: str,
     sea_level: float = 0.0,
     ocean_mask: Optional[np.ndarray] = None,
+    crop_mask: Optional[np.ndarray] = None,
+    rectangular_crop: bool = True,
 ) -> Image.Image:
     """
     Generate a color-coded heightmap PNG and a grayscale PNG.
 
-    heightmap.png   — grayscale by elevation + steel-blue ocean
+    heightmap.png      — elevation colour + steel-blue ocean
     heightmap_gray.png — pure grayscale (ocean = black)
 
-    Both images use the same 2nd–98th percentile normalisation over land
-    heights so colors are directly comparable between the two files.
+    Parameters
+    ----------
+    crop_mask       : Optional bool array (same shape as heightmap); True = inside
+                      crop polygon.  When rectangular_crop=False, pixels outside the
+                      mask become transparent (alpha=0) in both output files.
+    rectangular_crop: True  → fill outside-crop area with ocean (rectangular image).
+                      False → transparent background (RGBA PNG).
     """
     rows, cols = heightmap.shape
     print(f"\n[Heightmap Image]")
@@ -104,7 +156,7 @@ def generate_image(
         out_h = max(1, int(round(rows * scale)))
     print(f"  Output size  : {out_w} x {out_h} px")
 
-    # ── Stats (on original full-res data to be accurate) ─────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────
     lo = float(heightmap.min())
     hi = float(heightmap.max())
     if hi <= lo:
@@ -122,8 +174,11 @@ def generate_image(
     if ocean_mask is not None:
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
         print(f"  Ocean cover  : {pct:.1f}%")
+    if crop_mask is not None and not rectangular_crop:
+        pct_crop = 100.0 * crop_mask.sum() / crop_mask.size
+        print(f"  Crop (transparent outside): {pct_crop:.1f}% of bbox is inside polygon")
 
-    # ── Median filter: remove isolated deep-pixel anomalies ──────────────
+    # ── Median filter ─────────────────────────────────────────────────────
     print(f"  Median filter …", end=" ", flush=True)
     hm_filt = median_filter(heightmap.astype(np.float32), size=3)
     print("done")
@@ -138,32 +193,35 @@ def generate_image(
                             zoom_factors, order=0) > 0.5
         else:
             om_small = None
-        print(f"done  ({sm.shape[1]} × {sm.shape[0]} px)")
-        if om_small is not None:
-            print(f"  [debug] om_small coverage after resample: "
-                  f"{100.0*om_small.sum()/om_small.size:.1f}%")
+        if crop_mask is not None and not rectangular_crop:
+            cm_small = zoom(crop_mask.astype(np.float32),
+                            zoom_factors, order=0) > 0.5
         else:
-            print(f"  [debug] om_small is None after resample")
+            cm_small = None
+        print(f"done  ({sm.shape[1]} × {sm.shape[0]} px)")
     else:
         sm = hm_filt
         om_small = ocean_mask
+        cm_small = (crop_mask if (crop_mask is not None and not rectangular_crop)
+                    else None)
 
-    # ── Gaussian smooth at output resolution ─────────────────────────────
+    # ── Gaussian smooth ───────────────────────────────────────────────────
     scale_for_sigma = out_w / cols if cols > 0 else 1.0
     sigma_px = smooth_sigma * scale_for_sigma
     if sigma_px > 0.1:
         sm = gaussian_filter(sm, sigma=sigma_px)
 
-    # ── Build hillshaded RGB and save ─────────────────────────────────────
+    # ── Color PNG ─────────────────────────────────────────────────────────
     print(f"  Building RGB …", end=" ", flush=True)
-    rgb = _build_rgb(sm, om_small, lo, hi)
+    rgb = _build_rgb(sm, om_small, lo, hi, sea_level)
     print("done")
 
-    img = Image.fromarray(rgb, "RGB")
+    img = _apply_alpha(rgb, cm_small)
     img.save(output_path)
-    print(f"  Saved -> {output_path}")
+    suffix = "RGBA" if cm_small is not None else "RGB"
+    print(f"  Saved ({suffix}) -> {output_path}")
 
-    # ── Build plain grayscale and save ────────────────────────────────────
+    # ── Grayscale PNG ─────────────────────────────────────────────────────
     gray_path = os.path.splitext(output_path)[0] + "_gray.png"
     print(f"  Building grayscale …", end=" ", flush=True)
     gray_f = np.clip((sm - lo) / (hi - lo), 0.0, 1.0)
@@ -171,8 +229,9 @@ def generate_image(
     if om_small is not None:
         gray_u8[om_small] = 0  # ocean = black
     print("done")
-    gray_img = Image.fromarray(gray_u8, "L")
+    gray_img = _apply_alpha(gray_u8, cm_small)
     gray_img.save(gray_path)
-    print(f"  Saved -> {gray_path}")
+    suffix_g = "RGBA" if cm_small is not None else "L"
+    print(f"  Saved ({suffix_g}) -> {gray_path}")
 
     return img

@@ -21,7 +21,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 # Ensure UTF-8 output on Windows (arrows, em-dashes, etc.)
 if hasattr(sys.stdout, "reconfigure"):
@@ -35,6 +35,51 @@ from mc_to_stl.ocean import (
     detect_sea_level, build_ocean_mask, remove_micro_islands,
     apply_ocean_mask, apply_polygon_masks,
 )
+
+
+# ─── Config format helpers ────────────────────────────────────────────────────
+
+def _parse_config(data: Dict) -> Dict:
+    """
+    Accept both the old flat config format and the new sectioned format.
+
+    New format:
+      { "configuration": {...}, "crop_area": [[x,z],...], "sea_masking": [[[x,z],...]] }
+
+    Old flat format (backward compat):
+      { "save_path": ..., "crop_x1": ..., "polygon_json": ..., ... }
+    """
+    if "configuration" in data:
+        params: Dict = dict(data["configuration"])
+        params["crop_area"] = data.get("crop_area")        # list of [x,z] or None
+        params["sea_masking"] = data.get("sea_masking") or []
+    else:
+        params = dict(data)
+        # Convert old individual crop corners → crop_area list
+        if params.get("crop_x1") is not None:
+            params["crop_area"] = [
+                [params.pop("crop_x1"), params.pop("crop_z1")],
+                [params.pop("crop_x2"), params.pop("crop_z2")],
+                [params.pop("crop_x3"), params.pop("crop_z3")],
+                [params.pop("crop_x4"), params.pop("crop_z4")],
+            ]
+        # Old polygon_json handled at runtime in stage_process for backward compat
+        params.setdefault("sea_masking", [])
+    return params
+
+
+def _serialize_config(params: Dict) -> Dict:
+    """Serialize params to the new unified sectioned config format."""
+    skip = {"crop_area", "sea_masking", "timestamp", "polygon_json",
+            "crop_x1", "crop_z1", "crop_x2", "crop_z2",
+            "crop_x3", "crop_z3", "crop_x4", "crop_z4"}
+    configuration = {k: v for k, v in params.items()
+                     if not k.startswith("_") and k not in skip}
+    return {
+        "configuration": configuration,
+        "crop_area": params.get("crop_area"),
+        "sea_masking": params.get("sea_masking") or [],
+    }
 
 
 # ─── Prompt helpers ───────────────────────────────────────────────────────────
@@ -222,12 +267,25 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
             d("min_land_area", 2_000), mn=0,
         )
 
-    print("  Polygon masks: JSON file with areas to force to sea level (e.g. NPC")
-    print("  villages, lakes, custom bays). Format: [{\"coordinates\":[[x,z],...]}]")
-    polygon_json = _ask_str(
-        "Polygon mask JSON file path (leave blank to skip)",
-        d("polygon_json", ""),
-    )
+    print("  Sea masking polygons: JSON file with areas to force to sea level.")
+    print("  Format: [[[x,z],...], ...] OR legacy [{\"coordinates\":[[x,z],...]}]")
+    print("  Leave blank to keep existing inline polygons (if any) or skip.")
+    _sea_masking_file = _ask_str("Sea masking JSON file path (blank to skip/keep)", "")
+    if _sea_masking_file and os.path.isfile(_sea_masking_file):
+        with open(_sea_masking_file, encoding="utf-8") as _f:
+            _raw_polys = json.load(_f)
+        sea_masking: List = []
+        for _poly in _raw_polys:
+            if isinstance(_poly, dict):
+                sea_masking.append(_poly.get("coordinates", []))
+            else:
+                sea_masking.append(_poly)
+        print(f"  Loaded {len(sea_masking)} polygon(s) from {_sea_masking_file}")
+    elif _sea_masking_file:
+        print(f"  File not found: {_sea_masking_file}")
+        sea_masking = d("sea_masking", []) or []
+    else:
+        sea_masking = d("sea_masking", []) or []
 
     # ── Java-only: floating block removal ────────────────────────────────
     if not is_bedrock:
@@ -257,23 +315,29 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
 
     # ── Crop region ───────────────────────────────────────────────────────
     _sec("Crop Region  (optional)")
-    print("  Define a 4-corner quadrilateral in Minecraft block coords (X, Z).")
+    print("  Define a quadrilateral in Minecraft block coords (X, Z).")
     print("  Only blocks inside this polygon appear in the output.")
-    _has_crop = d("crop_x1", None) is not None
-    enable_crop = _ask_bool("Crop to a quadrilateral region?", default=_has_crop)
+    _existing_crop = d("crop_area", None)
+    # Backward compat: old configs stored crop as individual corner keys
+    if _existing_crop is None and d("crop_x1", None) is not None:
+        _existing_crop = [
+            [d("crop_x1", 0), d("crop_z1", 0)],
+            [d("crop_x2", 0), d("crop_z2", 0)],
+            [d("crop_x3", 0), d("crop_z3", 0)],
+            [d("crop_x4", 0), d("crop_z4", 0)],
+        ]
+    enable_crop = _ask_bool("Crop to a quadrilateral region?",
+                            default=_existing_crop is not None)
     if enable_crop:
         print("  Enter block coordinates for the 4 corners (can be negative).")
-        crop_x1 = _ask("Corner 1 X", d("crop_x1", 0), int)
-        crop_z1 = _ask("Corner 1 Z", d("crop_z1", 0), int)
-        crop_x2 = _ask("Corner 2 X", d("crop_x2", 0), int)
-        crop_z2 = _ask("Corner 2 Z", d("crop_z2", 0), int)
-        crop_x3 = _ask("Corner 3 X", d("crop_x3", 0), int)
-        crop_z3 = _ask("Corner 3 Z", d("crop_z3", 0), int)
-        crop_x4 = _ask("Corner 4 X", d("crop_x4", 0), int)
-        crop_z4 = _ask("Corner 4 Z", d("crop_z4", 0), int)
+        _def = _existing_crop or [[0, 0], [0, 0], [0, 0], [0, 0]]
+        crop_area: Optional[List] = [
+            [_ask(f"Corner {i+1} X", _def[i][0], int),
+             _ask(f"Corner {i+1} Z", _def[i][1], int)]
+            for i in range(4)
+        ]
     else:
-        crop_x1 = crop_z1 = crop_x2 = crop_z2 = None
-        crop_x3 = crop_z3 = crop_x4 = crop_z4 = None
+        crop_area = None
 
     _sec("Output Stages")
     generate_heightmap = _ask_bool("Generate heightmap images?", default=d("generate_heightmap", True))
@@ -281,20 +345,21 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
     generate_mosaic = _ask_bool("Generate mosaic STLs?", default=d("generate_mosaic", True))
 
     _sec("Heightmap Image")
-    print("  Color: sea level = green, max altitude = red, below sea = blue")
-    print("  Gamma < 1.0 amplifies low-relief areas (0.5-0.7 recommended for flat maps)")
     print("  Use 0 for full block resolution (one pixel per Minecraft block).")
     max_px_w  = _ask_int("Max image width   (px, 0 = full)", d("max_px_w", 4096), mn=0)
     max_px_h  = _ask_int("Max image height  (px, 0 = full)", d("max_px_h", 4096), mn=0)
-    gamma     = _ask_float("Relief gamma", d("gamma", 0.6), mn=0.05)
+    print("  Rectangular crop: YES = fill outside polygon with ocean (rectangular image).")
+    print("  NO = transparent background (RGBA PNG, outside polygon has alpha=0).")
+    rectangular_crop = _ask_bool("Rectangular crop output?",
+                                 default=d("rectangular_crop", True))
 
     _sec("STL Physical Dimensions")
-    print("  These are MAXIMUM bounds — aspect ratio is preserved.")
-    print("  A 2000×1400 mm limit on a square map produces ~1400×1400 mm.")
-    print("  Z scale is independent of XY.")
+    print("  Max X/Y are maximum bounds — aspect ratio is always preserved.")
     max_x_mm  = _ask_float("Max X  (mm)", d("max_x_mm", 200.0))
     max_y_mm  = _ask_float("Max Y  (mm)", d("max_y_mm", 200.0))
-    max_z_mm  = _ask_float("Max Z  (altitude, mm)", d("max_z_mm", 30.0))
+    print("  Z exaggeration: 1.0 = same scale as XY (physically accurate but very flat),")
+    print("  10.0 = 10× taller. A value of 5–15 is typical for printable terrain models.")
+    z_exaggeration = _ask_float("Z exaggeration factor", d("z_exaggeration", 1.0), mn=0.01)
     base_mm   = _ask_float("Base plate thickness (mm)", d("base_mm", 2.0))
     print("  Sea level drain: pretend the sea is N blocks lower than it really is.")
     print("  Shallow seafloor exposed this way prints as terrain; deep ocean stays flat.")
@@ -329,19 +394,17 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         sea_level=sea_level,
         min_ocean_blocks=min_ocean_blocks,
         min_land_area=min_land_area,
-        polygon_json=polygon_json,
         detect_floating=detect_floating,
         force_scan=force_scan,
-        crop_x1=crop_x1, crop_z1=crop_z1,
-        crop_x2=crop_x2, crop_z2=crop_z2,
-        crop_x3=crop_x3, crop_z3=crop_z3,
-        crop_x4=crop_x4, crop_z4=crop_z4,
+        crop_area=crop_area,
+        sea_masking=sea_masking,
         generate_heightmap=generate_heightmap,
         generate_stl=generate_stl,
         generate_mosaic=generate_mosaic,
         max_px_w=max_px_w, max_px_h=max_px_h,
-        gamma=gamma,
-        max_x_mm=max_x_mm, max_y_mm=max_y_mm, max_z_mm=max_z_mm,
+        rectangular_crop=rectangular_crop,
+        max_x_mm=max_x_mm, max_y_mm=max_y_mm,
+        z_exaggeration=z_exaggeration,
         base_mm=base_mm,
         sea_level_offset=sea_level_offset,
         max_verts=max_verts,
@@ -384,12 +447,11 @@ def _invalidate_stale_stages(cp: Checkpoint, params: Dict) -> None:
         return any(not _val_eq(old.get(k), params.get(k)) for k in keys)
 
     LOAD_KEYS   = {"save_path", "ground_only", "detect_floating", "force_scan",
-                   "crop_x1", "crop_z1", "crop_x2", "crop_z2",
-                   "crop_x3", "crop_z3", "crop_x4", "crop_z4"}
+                   "crop_area"}
     PROC_KEYS   = {"mask_ocean", "sea_level", "sea_level_offset",
-                   "min_ocean_blocks", "min_land_area", "polygon_json"}
-    IMG_KEYS    = {"smooth_sigma", "gamma", "max_px_w", "max_px_h"}
-    STL_KEYS    = {"smooth_sigma", "max_x_mm", "max_y_mm", "max_z_mm",
+                   "min_ocean_blocks", "min_land_area", "sea_masking"}
+    IMG_KEYS    = {"smooth_sigma", "max_px_w", "max_px_h", "rectangular_crop"}
+    STL_KEYS    = {"smooth_sigma", "max_x_mm", "max_y_mm", "z_exaggeration",
                    "base_mm", "max_verts"}
     MOSAIC_KEYS = {"tile_x_mm", "tile_y_mm", "skip_ocean_stl"}
 
@@ -426,31 +488,29 @@ def _invalidate_stale_stages(cp: Checkpoint, params: Dict) -> None:
 # ─── Processing stages ────────────────────────────────────────────────────────
 
 def stage_load(cp: Checkpoint, params: Dict):
-    """Load or resume heightmap from save."""
+    """Load or resume heightmap from save. Returns (hm, crop_mask)."""
+    _crop_mask_path = os.path.join(params.get("out_dir", ""), ".crop_mask.npy")
+
     if cp.is_done("loaded"):
         print("\n[Resume] Loading cached heightmap …")
         hm = cp.load_raw_heightmap()
         if hm is not None:
             print(f"  Heightmap: {hm.shape[1]} × {hm.shape[0]} blocks  "
                   f"Y={hm.min():.0f}..{hm.max():.0f}")
-            # Restore world origin saved during the original load run.
             for key in ("_min_cx", "_min_cz"):
                 if params.get(key) is None and cp.params.get(key) is not None:
                     params[key] = cp.params[key]
-            return hm
+            crop_mask = None
+            if os.path.exists(_crop_mask_path):
+                import numpy as _np
+                crop_mask = _np.load(_crop_mask_path)
+            return hm, crop_mask
         print("  Cache missing — re-loading from save.")
 
     _sec("Loading Save")
-    crop_poly = None
-    if params.get("crop_x1") is not None:
-        crop_poly = [
-            [params["crop_x1"], params["crop_z1"]],
-            [params["crop_x2"], params["crop_z2"]],
-            [params["crop_x3"], params["crop_z3"]],
-            [params["crop_x4"], params["crop_z4"]],
-        ]
+    crop_poly = params.get("crop_area")  # list of [x,z] pairs or None
     try:
-        hm, meta = load_save(
+        hm, meta, crop_mask = load_save(
             params["save_path"],
             out_dir=params["out_dir"],
             ground_only=params["ground_only"],
@@ -466,13 +526,15 @@ def stage_load(cp: Checkpoint, params: Dict):
         sys.exit(1)
 
     print(f"  Height range: Y={hm.min():.0f} .. Y={hm.max():.0f}")
-    # Store world origin so polygon masks can convert block coords → pixels
     params["_min_cx"] = int(meta.get("min_cx", 0))
     params["_min_cz"] = int(meta.get("min_cz", 0))
     cp.set_params(params)
     cp.save_raw_heightmap(hm)
-    cp.cleanup_after_load()   # chunk cache no longer needed
-    return hm
+    cp.cleanup_after_load()
+    if crop_mask is not None:
+        import numpy as _np
+        _np.save(_crop_mask_path, crop_mask)
+    return hm, crop_mask
 
 
 def stage_process(cp: Checkpoint, params: Dict, hm_raw):
@@ -490,8 +552,16 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
 
     _sec("Processing Heightmap")
 
-    polygon_json = params.get("polygon_json", "")
-    has_polygons = bool(polygon_json and os.path.isfile(polygon_json))
+    sea_masking: List = params.get("sea_masking") or []
+    # Backward compat: if old-format polygon_json is still in params, load it now
+    if not sea_masking and params.get("polygon_json"):
+        _pj = params["polygon_json"]
+        if os.path.isfile(_pj):
+            with open(_pj, encoding="utf-8") as _f:
+                _raw = json.load(_f)
+            sea_masking = [p.get("coordinates", p) if isinstance(p, dict) else p
+                           for p in _raw]
+    has_polygons = bool(sea_masking)
 
     # Early exit only when there is truly nothing to do
     if not params["mask_ocean"] and not has_polygons:
@@ -556,10 +626,7 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
     cp.set_params(params)
 
     if has_polygons:
-        import json as _json
-        print(f"\n  [Polygon masks]")
-        with open(polygon_json, encoding="utf-8") as f:
-            polygons = _json.load(f)
+        print(f"\n  [Sea masking polygons]  ({len(sea_masking)} polygon(s))")
         world_origin = (
             params.get("_min_cx", 0) * 16,
             params.get("_min_cz", 0) * 16,
@@ -570,7 +637,7 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         else:
             print(f"    Ocean before  : (no ocean mask — mask_ocean is off)")
         hm_work, ocean_mask = apply_polygon_masks(
-            hm_work, ocean_mask, polygons, effective_sea_level, world_origin,
+            hm_work, ocean_mask, sea_masking, effective_sea_level, world_origin,
         )
         if ocean_mask is not None:
             print(f"    Ocean after   : {100.0*ocean_mask.sum()/ocean_mask.size:.1f}%")
@@ -583,9 +650,8 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
     return hm_work, ocean_mask
 
 
-def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
+def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask, crop_mask=None):
     if cp.is_done("image"):
-        # Re-run if the grayscale output is missing (e.g. first run after upgrade).
         gray_path = os.path.join(params["out_dir"], "heightmap_gray.png")
         if os.path.isfile(gray_path):
             print("\n[Resume] Heightmap image already done — skipping.")
@@ -595,15 +661,14 @@ def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
     _sec("Heightmap Image")
     _sl = params.get("sea_level") or 0
     img_path = os.path.join(params["out_dir"], "heightmap.png")
-    # Use original sea_level as colour reference — ocean cells in hm_work sit
-    # at effective_sea_level (≤ sea_level) and are overridden to steel-blue by
-    # the ocean_mask, so the image always shows the real coastline.
     generate_image(
         hm_work,
         params["max_px_w"], params["max_px_h"],
         params["smooth_sigma"], img_path,
         sea_level=float(_sl),
         ocean_mask=ocean_mask,
+        crop_mask=crop_mask,
+        rectangular_crop=params.get("rectangular_crop", True),
     )
     cp.mark_done("image")
 
@@ -615,8 +680,9 @@ def stage_stl(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
     stl_path = os.path.join(params["out_dir"], "terrain.stl")
     generate_single_stl(
         hm_work,
-        params["max_x_mm"], params["max_y_mm"], params["max_z_mm"],
+        params["max_x_mm"], params["max_y_mm"],
         params["base_mm"], params["smooth_sigma"], stl_path,
+        z_exaggeration=params.get("z_exaggeration", 1.0),
         max_vertices=params["max_verts"],
         ocean_mask=ocean_mask,
     )
@@ -631,9 +697,10 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         return
     generate_mosaic_stl(
         hm_work,
-        params["max_x_mm"], params["max_y_mm"], params["max_z_mm"],
+        params["max_x_mm"], params["max_y_mm"],
         params["tile_x_mm"], params["tile_y_mm"],
         params["base_mm"], params["smooth_sigma"], tiles_dir,
+        z_exaggeration=params.get("z_exaggeration", 1.0),
         max_vertices=params["max_verts"],
         existing_tiles=existing,
         ocean_mask=ocean_mask,
@@ -672,10 +739,9 @@ def main() -> None:
     unattended = False
 
     if config_arg:
-        # --config=path given on command line → always unattended
         if os.path.isfile(config_arg):
             with open(config_arg, encoding="utf-8") as _f:
-                saved_config = json.load(_f)
+                saved_config = _parse_config(json.load(_f))
             print(f"\n  Config: {config_arg}  (unattended mode)")
             unattended = True
         else:
@@ -688,7 +754,7 @@ def main() -> None:
             _cfg_path = os.path.expanduser(_cfg_raw)
             if os.path.isfile(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
-                    saved_config = json.load(_f)
+                    saved_config = _parse_config(json.load(_f))
                 print(f"  Loaded: {_cfg_path}  (unattended mode)")
                 unattended = True
             else:
@@ -699,12 +765,10 @@ def main() -> None:
     out_dir = params["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── Save config for future runs ───────────────────────────────────────
+    # ── Save config for future runs (new sectioned format) ───────────────
     _cfg_out = os.path.join(out_dir, "config.json")
-    _cfg_data = {k: v for k, v in params.items()
-                 if not k.startswith("_") and k != "timestamp"}
     with open(_cfg_out, "w", encoding="utf-8") as _f:
-        json.dump(_cfg_data, _f, indent=2, ensure_ascii=False)
+        json.dump(_serialize_config(params), _f, indent=2, ensure_ascii=False)
     if not unattended:
         print(f"\n  Config saved → {_cfg_out}")
 
@@ -731,10 +795,10 @@ def main() -> None:
     print(f"  Starting conversion — outputs → {out_dir}/")
     print(f"{'═' * 62}")
 
-    hm_raw   = stage_load(cp, params)
+    hm_raw, crop_mask = stage_load(cp, params)
     hm_work, ocean_mask = stage_process(cp, params, hm_raw)
     if params.get("generate_heightmap", True):
-        stage_image(cp, params, hm_work, ocean_mask)
+        stage_image(cp, params, hm_work, ocean_mask, crop_mask=crop_mask)
     else:
         print("\n[Skip] Heightmap image generation disabled by config.")
     if params.get("generate_stl", True):

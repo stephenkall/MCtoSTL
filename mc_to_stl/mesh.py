@@ -146,10 +146,10 @@ def generate_single_stl(
     heightmap: np.ndarray,
     max_x_mm: float,
     max_y_mm: float,
-    max_z_mm: float,
     base_mm: float,
     smooth_sigma: float,
     output_path: str,
+    z_exaggeration: float = 1.0,
     max_vertices: int = 2000,
     ocean_mask: Optional[np.ndarray] = None,
 ) -> None:
@@ -180,18 +180,19 @@ def generate_single_stl(
         h_range = 1.0
 
     xy_scale = _uniform_scale(max_x_mm, max_y_mm, cols, rows)
-    z_scale  = max_z_mm / h_range
+    z_scale  = xy_scale * z_exaggeration
     actual_x = (cols - 1) * xy_scale
     actual_y = (rows - 1) * xy_scale
+    actual_z = h_range * z_scale
 
     n_tris   = count_solid_triangles(rows, cols)
     size_mb  = n_tris * 50 / 1_048_576
 
     print(f"  Mesh        : {cols} × {rows} vertices")
     print(f"  XY scale    : {xy_scale:.4f} mm/vertex  (aspect preserved)")
-    print(f"  Z scale     : {z_scale:.4f} mm/unit  (range {h_range:.0f})")
+    print(f"  Z scale     : {z_scale:.4f} mm/unit  ({z_exaggeration:.2f}× XY,  range {h_range:.0f} blk)")
     print(f"  Dimensions  : {actual_x:.1f} × {actual_y:.1f} × "
-          f"{h_range*z_scale + base_mm:.1f} mm")
+          f"{actual_z + base_mm:.1f} mm")
     print(f"  Triangles   : {n_tris:,}  (~{size_mb:.0f} MB)")
 
     gen = _iter_solid(
@@ -214,12 +215,12 @@ def generate_mosaic_stl(
     heightmap: np.ndarray,
     max_x_mm: float,
     max_y_mm: float,
-    max_z_mm: float,
     tile_x_mm: float,
     tile_y_mm: float,
     base_mm: float,
     smooth_sigma: float,
     output_dir: str,
+    z_exaggeration: float = 1.0,
     max_vertices: int = 2000,
     existing_tiles: Optional[Set[Tuple[int, int]]] = None,
     ocean_mask: Optional[np.ndarray] = None,
@@ -260,7 +261,7 @@ def generate_mosaic_stl(
         h_range = 1.0
 
     xy_scale = _uniform_scale(max_x_mm, max_y_mm, cols, rows)
-    z_scale  = max_z_mm / h_range
+    z_scale  = xy_scale * z_exaggeration
 
     # Tile vertex counts (include shared boundary vertex)
     tile_cols = max(2, int(round(tile_x_mm / xy_scale)) + 1)
@@ -299,7 +300,7 @@ def generate_mosaic_stl(
     actual_x = (cols - 1) * xy_scale
     actual_y = (rows - 1) * xy_scale
     print(f"  Global scale : XY={xy_scale:.4f}  Z={z_scale:.4f} mm/unit  "
-          f"(aspect preserved)")
+          f"(Z={z_exaggeration:.2f}× XY,  aspect preserved)")
     print(f"  Full model   : {actual_x:.1f} × {actual_y:.1f} mm")
     print(f"  Tile size    : {stride_c * xy_scale:.1f} × {stride_r * xy_scale:.1f} mm  "
           f"({stride_c} × {stride_r} vertices)")

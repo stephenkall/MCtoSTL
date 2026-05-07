@@ -174,6 +174,7 @@ def _crop_to_polygon(
 
     outside = ~_points_in_polygon(xs_grid, zs_grid, crop_poly.astype(np.float32))
     cropped[outside] = float(heightmap.min())
+    crop_mask = ~outside  # True = inside polygon
 
     new_min_cx = min_cx + col0 // 16
     new_min_cz = min_cz + row0 // 16
@@ -186,7 +187,7 @@ def _crop_to_polygon(
         "min_cz": new_min_cz,
         "max_cz": new_min_cz + (rows_c + 15) // 16 - 1,
     }
-    return cropped, new_meta
+    return cropped, new_meta, crop_mask
 
 
 def _parse_worker(args: Tuple) -> Tuple[str, Dict]:
@@ -291,7 +292,7 @@ def load_save(
     detect_floating: bool = False,
     force_scan: bool = False,
     crop_poly: Optional[List] = None,
-) -> Tuple[np.ndarray, Dict]:
+) -> Tuple[np.ndarray, Dict, Optional[np.ndarray]]:
     """
     Load a Minecraft save (Java or Bedrock Edition) into a heightmap array.
 
@@ -315,11 +316,13 @@ def load_save(
     heightmap : np.ndarray  shape (Z_blocks, X_blocks), float32
     meta      : dict  width_blocks, height_blocks, chunk extents, format
     """
+    crop_mask: Optional[np.ndarray] = None
     if force_scan:
         use_cache = False   # stale stored heightmaps → cached data would be wrong
     fmt = detect_save_format(save_path)
     if fmt == "bedrock":
-        return _load_bedrock(save_path, out_dir, debug, use_cache)
+        hm, meta = _load_bedrock(save_path, out_dir, debug, use_cache)
+        return hm, meta, None
 
     # ── Java Edition ──────────────────────────────────────────────────────
     region_path = find_region_dir(save_path)
@@ -423,7 +426,7 @@ def load_save(
     if crop_poly is not None:
         crop_arr = np.array(crop_poly, dtype=np.float64)
         print(f"  Applying crop polygon …", end=" ", flush=True)
-        hm, meta = _crop_to_polygon(hm, meta, crop_arr)
+        hm, meta, crop_mask = _crop_to_polygon(hm, meta, crop_arr)
         print(f"done  ({meta['width_blocks']} × {meta['height_blocks']} blocks)")
 
-    return hm, meta
+    return hm, meta, crop_mask

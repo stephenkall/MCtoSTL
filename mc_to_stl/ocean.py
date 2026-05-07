@@ -254,7 +254,7 @@ def apply_ocean_mask(
 def apply_polygon_masks(
     heightmap: np.ndarray,
     ocean_mask: Optional[np.ndarray],
-    polygons: List[dict],
+    polygons: List,
     sea_level: int,
     world_origin: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -264,7 +264,9 @@ def apply_polygon_masks(
 
     Parameters
     ----------
-    polygons     : list of dicts with {"coordinates": [[x, z], ...]}
+    polygons     : list of polygons, each polygon in one of two formats:
+                     new: [[x, z], [x, z], ...]
+                     old: {"coordinates": [[x, z], ...]}
                    where x, z are Minecraft block coordinates.
     sea_level    : Y value assigned to masked cells.
     world_origin : (min_x_block, min_z_block) — Minecraft block coords that
@@ -283,7 +285,11 @@ def apply_polygon_masks(
 
     total_masked = 0
     for poly in polygons:
-        coords = poly.get("coordinates", [])
+        # Accept both new [[x,z],...] and old {"coordinates": [[x,z],...]} format
+        if isinstance(poly, dict):
+            coords = poly.get("coordinates", [])
+        else:
+            coords = poly
         if len(coords) < 3:
             continue
 
