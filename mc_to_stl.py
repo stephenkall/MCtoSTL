@@ -39,7 +39,20 @@ from mc_to_stl.ocean import (
 
 # ─── Prompt helpers ───────────────────────────────────────────────────────────
 
+# Mutable context — set to True when running from a config file (no prompts).
+_ctx: Dict[str, Any] = {"unattended": False}
+
+
 def _ask(prompt: str, default: Any, cast, minimum=None) -> Any:
+    if _ctx["unattended"]:
+        if default == "" or default is None:
+            print(f"\n  ERROR: No config value for '{prompt}' — required in unattended mode.")
+            sys.exit(1)
+        val = cast(default)
+        if minimum is not None and val < minimum:
+            print(f"\n  ERROR: Config value for '{prompt}' = {val} is below minimum {minimum}.")
+            sys.exit(1)
+        return val
     label = f"[{default}]" if default != "" else ""
     while True:
         raw = input(f"  {prompt} {label}: ").strip()
@@ -61,6 +74,8 @@ def _ask_str(p, d=""):          return _ask(p, d, str)
 
 
 def _ask_bool(prompt: str, default: bool = True) -> bool:
+    if _ctx["unattended"]:
+        return bool(default)
     sfx = "Y/n" if default else "y/N"
     while True:
         raw = input(f"  {prompt} [{sfx}]: ").strip().lower()
@@ -74,6 +89,11 @@ def _ask_bool(prompt: str, default: bool = True) -> bool:
 
 
 def _ask_path(prompt: str, default: str = "") -> str:
+    if _ctx["unattended"]:
+        if not default:
+            print(f"\n  ERROR: No config path for '{prompt}' — required in unattended mode.")
+            sys.exit(1)
+        return os.path.expanduser(default)
     sfx = f" [{default}]" if default else ""
     while True:
         raw = input(f"  {prompt}{sfx}: ").strip()
@@ -99,11 +119,14 @@ def _banner() -> None:
 
 # ─── Collect ALL parameters before touching the save ─────────────────────────
 
-def collect_params(saved: Dict = None) -> Dict:
+def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
     """
     Ask all configuration questions upfront.
-    If `saved` is provided (resume), pre-fill answers with saved values.
+    If `saved` is provided, pre-fill answers with saved values.
+    If `unattended=True`, use saved values without prompting (requires a
+    complete config — missing required fields cause an immediate error).
     """
+    _ctx["unattended"] = unattended
     p = saved or {}
 
     def d(key, fallback):
@@ -128,17 +151,20 @@ def collect_params(saved: Dict = None) -> Dict:
     _sec("Output")
     out_dir = _ask_path("Output directory", default=d("out_dir", "mc_output"))
 
-    _cp_path = os.path.join(out_dir, ".checkpoint.json")
-    if os.path.exists(_cp_path):
-        try:
-            with open(_cp_path, encoding="utf-8") as _f:
-                _cp_data = json.load(_f)
-            _cp_params = _cp_data.get("params") or _cp_data
-            if _cp_params.get("save_path") == save_path:
-                if _ask_bool("Checkpoint found - resume from where you left off?", default=True):
-                    p = _cp_params
-        except Exception:
-            pass
+    # Only offer checkpoint resume in interactive mode and when no config was
+    # loaded; if the user provided a config, they want those exact values.
+    if saved is None:
+        _cp_path = os.path.join(out_dir, ".checkpoint.json")
+        if os.path.exists(_cp_path):
+            try:
+                with open(_cp_path, encoding="utf-8") as _f:
+                    _cp_data = json.load(_f)
+                _cp_params = _cp_data.get("params") or _cp_data
+                if _cp_params.get("save_path") == save_path:
+                    if _ask_bool("Checkpoint found - resume from where you left off?", default=True):
+                        p = _cp_params
+            except Exception:
+                pass
 
     # ── Java-only: parallelism ────────────────────────────────────────────
     if not is_bedrock:
@@ -181,9 +207,12 @@ def collect_params(saved: Dict = None) -> Dict:
 
     if mask_ocean:
         print(f"  (Sea level will be auto-detected from the heightmap.)")
-        print(f"  Override sea level Y — leave blank to auto-detect:")
-        sea_level_input = input(f"  Sea level Y [auto]: ").strip()
-        sea_level = int(sea_level_input) if sea_level_input else None   # None = auto
+        if _ctx["unattended"]:
+            sea_level = d("sea_level", None)
+        else:
+            print(f"  Override sea level Y — leave blank to auto-detect:")
+            sea_level_input = input(f"  Sea level Y [auto]: ").strip()
+            sea_level = int(sea_level_input) if sea_level_input else None   # None = auto
         min_ocean_blocks = _ask_int(
             "Min ocean area (blocks²) — larger = keep more small seas as land",
             d("min_ocean_blocks", 500_000), mn=1,
@@ -276,6 +305,77 @@ def collect_params(saved: Dict = None) -> Dict:
     )
 
 
+# ─── Checkpoint invalidation ─────────────────────────────────────────────────
+
+def _val_eq(a: Any, b: Any) -> bool:
+    """Equality that treats 1 and 1.0 as the same (JSON int vs Python float)."""
+    if a == b:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return str(a) == str(b)
+
+
+def _invalidate_stale_stages(cp: Checkpoint, params: Dict) -> None:
+    """
+    Compare current params against what is stored in the checkpoint.
+    Unmark any downstream stages whose inputs have changed so they are
+    regenerated on this run.
+
+    Stage dependency groups:
+      loaded    → save_path, ground_only, detect_floating
+      processed → mask_ocean, sea_level, sea_level_offset, ocean thresholds,
+                  polygon masks
+      image/stl/mosaic → sigma, gamma, physical dimensions, tile sizes
+    """
+    old = cp.params
+    if not old:
+        return
+
+    def changed(keys):
+        return any(not _val_eq(old.get(k), params.get(k)) for k in keys)
+
+    LOAD_KEYS   = {"save_path", "ground_only", "detect_floating"}
+    PROC_KEYS   = {"mask_ocean", "sea_level", "sea_level_offset",
+                   "min_ocean_blocks", "min_land_area", "polygon_json"}
+    IMG_KEYS    = {"smooth_sigma", "gamma", "max_px_w", "max_px_h"}
+    STL_KEYS    = {"smooth_sigma", "max_x_mm", "max_y_mm", "max_z_mm",
+                   "base_mm", "max_verts"}
+    MOSAIC_KEYS = {"tile_x_mm", "tile_y_mm", "skip_ocean_stl"}
+
+    msgs = []
+
+    if changed(LOAD_KEYS):
+        cp.unmark_from("loaded")
+        msgs.append("save/load params changed — full re-parse needed")
+    elif changed(PROC_KEYS):
+        cp.unmark_from("processed")
+        msgs.append("ocean/masking params changed — re-processing terrain")
+    else:
+        if changed(IMG_KEYS):
+            cp.unmark("image")
+            msgs.append("image params changed — regenerating heightmap image")
+        if changed(STL_KEYS):
+            cp.unmark("stl")
+            msgs.append("STL params changed — regenerating terrain.stl")
+        if changed(STL_KEYS | MOSAIC_KEYS):
+            cp.unmark("mosaic")
+            # Tile files must be deleted so generate_mosaic_stl re-creates them
+            import shutil as _sh
+            tiles_dir = os.path.join(cp.out_dir, "tiles")
+            if os.path.isdir(tiles_dir):
+                _sh.rmtree(tiles_dir, ignore_errors=True)
+            msgs.append("tile params changed — regenerating mosaic tiles")
+
+    if msgs:
+        print(f"\n  [Checkpoint] {'; '.join(msgs)}.")
+    elif any(cp.is_done(s) for s in cp._STAGE_ORDER):
+        print(f"\n  [Checkpoint] Params unchanged — resuming from checkpoint.")
+
+
 # ─── Processing stages ────────────────────────────────────────────────────────
 
 def stage_load(cp: Checkpoint, params: Dict):
@@ -320,6 +420,11 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         print("\n[Resume] Loading cached processed heightmap …")
         hm_work, ocean_mask = cp.load_work_heightmap()
         if hm_work is not None:
+            # Restore sea level values that were resolved during a previous run
+            # (needed by stage_image even when processing is skipped).
+            for key in ("sea_level", "_effective_sea_level"):
+                if params.get(key) is None and cp.params.get(key) is not None:
+                    params[key] = cp.params[key]
             return hm_work, ocean_mask
         print("  Cache missing — re-processing.")
 
@@ -401,7 +506,8 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         )
 
     cp.save_work_heightmap(hm_work, ocean_mask)
-    cp.cleanup_after_process()   # raw heightmap no longer needed
+    # Raw heightmap is intentionally kept (heightmap_raw.npy) so the user can
+    # re-run with different ocean/image params without re-parsing region files.
     return hm_work, ocean_mask
 
 
@@ -410,8 +516,9 @@ def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         print("\n[Resume] Heightmap image already done — skipping.")
         return
     _sec("Heightmap Image")
-    # Use effective_sea_level for colour reference (0 = green on the gradient)
-    eff_sl = params.get("_effective_sea_level") or params.get("sea_level") or 0.0
+    _sl  = params.get("sea_level") or 0
+    _off = params.get("sea_level_offset", 0) or 0
+    eff_sl = float(_sl) - float(_off)
     img_path = os.path.join(params["out_dir"], "heightmap.png")
     generate_image(
         hm_work,
@@ -461,44 +568,68 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
-    args = sys.argv[1:]
-    diagnose_mode = "--diagnose" in args
-    force_fresh   = "--fresh"    in args
-    args = [a for a in args if not a.startswith("--")]
+    raw_args = sys.argv[1:]
+    diagnose_mode = "--diagnose" in raw_args
+    force_fresh   = "--fresh"    in raw_args
+
+    # Collect --config=path or plain path positional arg (for diagnose)
+    config_arg = None
+    positional_args = []
+    for a in raw_args:
+        if a.startswith("--config="):
+            config_arg = os.path.expanduser(a[9:])
+        elif not a.startswith("--"):
+            positional_args.append(a)
 
     _banner()
 
     # ── Diagnose mode ─────────────────────────────────────────────────────
     if diagnose_mode:
-        save = os.path.expanduser(args[0]) if args else _ask_path("Save folder")
+        save = os.path.expanduser(positional_args[0]) if positional_args else _ask_path("Save folder")
         _sec("Diagnosing chunk format")
         diagnose_save(save)
         return
 
-    # ── Optional: pre-fill prompts from a saved config file ──────────────
+    # ── Load config file (from CLI arg or interactive prompt) ─────────────
     saved_config = None
-    _sec("Configuration File")
-    _cfg_raw = input("  Load answers from a config file? (path or blank to skip): ").strip()
-    if _cfg_raw:
-        _cfg_path = os.path.expanduser(_cfg_raw)
-        if os.path.isfile(_cfg_path):
-            with open(_cfg_path, encoding="utf-8") as _f:
+    unattended = False
+
+    if config_arg:
+        # --config=path given on command line → always unattended
+        if os.path.isfile(config_arg):
+            with open(config_arg, encoding="utf-8") as _f:
                 saved_config = json.load(_f)
-            print(f"  Loaded: {_cfg_path}")
+            print(f"\n  Config: {config_arg}  (unattended mode)")
+            unattended = True
         else:
-            print(f"  File not found: {_cfg_path} — starting fresh.")
+            print(f"\n  ERROR: Config file not found: {config_arg}")
+            sys.exit(1)
+    else:
+        _sec("Configuration File")
+        _cfg_raw = input("  Config file path (or blank to answer prompts): ").strip()
+        if _cfg_raw:
+            _cfg_path = os.path.expanduser(_cfg_raw)
+            if os.path.isfile(_cfg_path):
+                with open(_cfg_path, encoding="utf-8") as _f:
+                    saved_config = json.load(_f)
+                print(f"  Loaded: {_cfg_path}  (unattended mode)")
+                unattended = True
+            else:
+                print(f"  File not found: {_cfg_path} — answering prompts.")
 
     # ── Collect all parameters ────────────────────────────────────────────
-    params = collect_params(saved=saved_config)
+    params = collect_params(saved=saved_config, unattended=unattended)
     out_dir = params["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Save config for future runs ───────────────────────────────────────
     _cfg_out = os.path.join(out_dir, "config.json")
-    _cfg_data = {k: v for k, v in params.items() if not k.startswith("_") and k != "timestamp"}
+    _cfg_data = {k: v for k, v in params.items()
+                 if not k.startswith("_") and k != "timestamp"}
     with open(_cfg_out, "w", encoding="utf-8") as _f:
         json.dump(_cfg_data, _f, indent=2, ensure_ascii=False)
-    print(f"\n  Config saved → {_cfg_out}")
+    if not unattended:
+        print(f"\n  Config saved → {_cfg_out}")
 
     # ── Initialise / load checkpoint ──────────────────────────────────────
     cp = Checkpoint(out_dir)
@@ -506,6 +637,9 @@ def main() -> None:
         cp.clear()
     else:
         cp.load()
+        # Invalidate downstream stages whose inputs have changed so they
+        # are regenerated automatically (e.g. sigma, gamma, z dimensions).
+        _invalidate_stale_stages(cp, params)
 
     params["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     cp.set_params(params)
@@ -520,7 +654,9 @@ def main() -> None:
     stage_image(cp, params, hm_work, ocean_mask)
     stage_stl(cp, params, hm_work, ocean_mask)
     stage_mosaic(cp, params, hm_work, ocean_mask)
-    cp.cleanup_after_outputs()   # work heightmap + ocean mask no longer needed
+    # Intermediate .npy files (heightmap_raw, heightmap_work, ocean_mask) are
+    # intentionally kept so that re-running with changed sigma / gamma / z-scale
+    # regenerates only the affected outputs without re-parsing region files.
 
     # ── Summary ───────────────────────────────────────────────────────────
     img_path  = os.path.join(out_dir, "heightmap.png")
