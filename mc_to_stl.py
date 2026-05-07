@@ -244,11 +244,17 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
     else:
         detect_floating = False
 
+    _sec("Output Stages")
+    generate_heightmap = _ask_bool("Generate heightmap images?", default=d("generate_heightmap", True))
+    generate_stl = _ask_bool("Generate single STL?", default=d("generate_stl", True))
+    generate_mosaic = _ask_bool("Generate mosaic STLs?", default=d("generate_mosaic", True))
+
     _sec("Heightmap Image")
     print("  Color: sea level = green, max altitude = red, below sea = blue")
-    print("  Gamma < 1.0 amplifies low-relief areas (0.5–0.7 recommended for flat maps)")
-    max_px_w  = _ask_int("Max image width   (px)", d("max_px_w", 4096))
-    max_px_h  = _ask_int("Max image height  (px)", d("max_px_h", 4096))
+    print("  Gamma < 1.0 amplifies low-relief areas (0.5-0.7 recommended for flat maps)")
+    print("  Use 0 for full block resolution (one pixel per Minecraft block).")
+    max_px_w  = _ask_int("Max image width   (px, 0 = full)", d("max_px_w", 4096), mn=0)
+    max_px_h  = _ask_int("Max image height  (px, 0 = full)", d("max_px_h", 4096), mn=0)
     gamma     = _ask_float("Relief gamma", d("gamma", 0.6), mn=0.05)
 
     _sec("STL Physical Dimensions")
@@ -294,6 +300,9 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         min_land_area=min_land_area,
         polygon_json=polygon_json,
         detect_floating=detect_floating,
+        generate_heightmap=generate_heightmap,
+        generate_stl=generate_stl,
+        generate_mosaic=generate_mosaic,
         max_px_w=max_px_w, max_px_h=max_px_h,
         gamma=gamma,
         max_x_mm=max_x_mm, max_y_mm=max_y_mm, max_z_mm=max_z_mm,
@@ -547,7 +556,6 @@ def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         params["smooth_sigma"], img_path,
         sea_level=float(_sl),
         ocean_mask=ocean_mask,
-        gamma=params["gamma"],
     )
     cp.mark_done("image")
 
@@ -677,9 +685,18 @@ def main() -> None:
 
     hm_raw   = stage_load(cp, params)
     hm_work, ocean_mask = stage_process(cp, params, hm_raw)
-    stage_image(cp, params, hm_work, ocean_mask)
-    stage_stl(cp, params, hm_work, ocean_mask)
-    stage_mosaic(cp, params, hm_work, ocean_mask)
+    if params.get("generate_heightmap", True):
+        stage_image(cp, params, hm_work, ocean_mask)
+    else:
+        print("\n[Skip] Heightmap image generation disabled by config.")
+    if params.get("generate_stl", True):
+        stage_stl(cp, params, hm_work, ocean_mask)
+    else:
+        print("\n[Skip] Single STL generation disabled by config.")
+    if params.get("generate_mosaic", True):
+        stage_mosaic(cp, params, hm_work, ocean_mask)
+    else:
+        print("\n[Skip] Mosaic STL generation disabled by config.")
     # Intermediate .npy files (heightmap_raw, heightmap_work, ocean_mask) are
     # intentionally kept so that re-running with changed sigma / gamma / z-scale
     # regenerates only the affected outputs without re-parsing region files.
