@@ -504,9 +504,17 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
             params.get("_min_cx", 0) * 16,
             params.get("_min_cz", 0) * 16,
         )
+        print(f"    World origin  : block X={world_origin[0]}, Z={world_origin[1]}")
+        print(f"    Map size      : {hm_work.shape[1]:,} × {hm_work.shape[0]:,} blocks")
+        if ocean_mask is not None:
+            print(f"    Ocean before  : {100.0*ocean_mask.sum()/ocean_mask.size:.1f}%")
+        else:
+            print(f"    Ocean before  : (no ocean mask — mask_ocean is off)")
         hm_work, ocean_mask = apply_polygon_masks(
             hm_work, ocean_mask, polygons, sea_level, world_origin,
         )
+        if ocean_mask is not None:
+            print(f"    Ocean after   : {100.0*ocean_mask.sum()/ocean_mask.size:.1f}%")
 
     cp.save_work_heightmap(hm_work, ocean_mask)
     # Downstream outputs (image, STL, tiles) are now stale — force regeneration.
