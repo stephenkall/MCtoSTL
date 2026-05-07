@@ -386,6 +386,10 @@ def stage_load(cp: Checkpoint, params: Dict):
         if hm is not None:
             print(f"  Heightmap: {hm.shape[1]} × {hm.shape[0]} blocks  "
                   f"Y={hm.min():.0f}..{hm.max():.0f}")
+            # Restore world origin saved during the original load run.
+            for key in ("_min_cx", "_min_cz"):
+                if params.get(key) is None and cp.params.get(key) is not None:
+                    params[key] = cp.params[key]
             return hm
         print("  Cache missing — re-loading from save.")
 
@@ -514,8 +518,13 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
 
 def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
     if cp.is_done("image"):
-        print("\n[Resume] Heightmap image already done — skipping.")
-        return
+        # Re-run if the grayscale output is missing (e.g. first run after upgrade).
+        gray_path = os.path.join(params["out_dir"], "heightmap_gray.png")
+        if os.path.isfile(gray_path):
+            print("\n[Resume] Heightmap image already done — skipping.")
+            return
+        print("\n[Resume] Grayscale image missing — regenerating.")
+        cp.unmark("image")
     _sec("Heightmap Image")
     _sl  = params.get("sea_level") or 0
     _off = params.get("sea_level_offset", 0) or 0
@@ -643,6 +652,11 @@ def main() -> None:
         _invalidate_stale_stages(cp, params)
 
     params["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # Preserve internal keys (_min_cx, _min_cz, _effective_sea_level, etc.)
+    # that were written by a previous stage run and are not in the user-facing params.
+    for k, v in cp.params.items():
+        if k.startswith("_") and params.get(k) is None:
+            params[k] = v
     cp.set_params(params)
 
     # ── Run stages ────────────────────────────────────────────────────────
@@ -660,17 +674,19 @@ def main() -> None:
     # regenerates only the affected outputs without re-parsing region files.
 
     # ── Summary ───────────────────────────────────────────────────────────
-    img_path  = os.path.join(out_dir, "heightmap.png")
-    stl_path  = os.path.join(out_dir, "terrain.stl")
-    tiles_dir = os.path.join(out_dir, "tiles")
+    img_path   = os.path.join(out_dir, "heightmap.png")
+    gray_path  = os.path.join(out_dir, "heightmap_gray.png")
+    stl_path   = os.path.join(out_dir, "terrain.stl")
+    tiles_dir  = os.path.join(out_dir, "tiles")
 
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║                          Done!                               ║")
     print("╠══════════════════════════════════════════════════════════════╣")
-    print(f"║  Heightmap image  →  {os.path.relpath(img_path):<39}║")
-    print(f"║  Full terrain STL →  {os.path.relpath(stl_path):<39}║")
-    print(f"║  Mosaic tiles     →  {os.path.relpath(tiles_dir) + '/':<39}║")
+    print(f"║  Heightmap (color)  →  {os.path.relpath(img_path):<37}║")
+    print(f"║  Heightmap (gray)   →  {os.path.relpath(gray_path):<37}║")
+    print(f"║  Full terrain STL   →  {os.path.relpath(stl_path):<37}║")
+    print(f"║  Mosaic tiles       →  {os.path.relpath(tiles_dir) + '/':<37}║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
 

@@ -26,6 +26,7 @@ processing so that all intermediate arrays are output-sized, not
 source-sized.  A 16k-block map rendered at 4096 px saves ~15× RAM.
 """
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -112,7 +113,11 @@ def generate_image(
     gamma: float = 0.6,
 ) -> Image.Image:
     """
-    Generate a color-coded heightmap PNG.
+    Generate a color-coded heightmap PNG and a grayscale PNG side-by-side.
+
+    The grayscale image uses the same downsample/smooth pipeline.  Ocean
+    pixels are black; land is mapped linearly from black (lowest land) to
+    white (highest land).  Saved to <output_path_stem>_gray.png.
 
     Downsamples to output dimensions before all processing so that memory
     usage scales with the output size, not the source map size.
@@ -160,7 +165,7 @@ def generate_image(
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
         print(f"  Ocean cover  : {pct:.1f}%")
 
-    # ── Build RGB and save ────────────────────────────────────────────────
+    # ── Build color RGB and save ──────────────────────────────────────────
     print(f"  Building RGB …", end=" ", flush=True)
     rgb = _build_rgb(sm, sea_level, gamma, om_small)
     print("done")
@@ -170,4 +175,26 @@ def generate_image(
     img = img.filter(ImageFilter.SMOOTH)
     img.save(output_path)
     print(f"  Saved -> {output_path}")
+
+    # ── Build grayscale and save ──────────────────────────────────────────
+    gray_path = os.path.splitext(output_path)[0] + "_gray.png"
+    print(f"  Building grayscale …", end=" ", flush=True)
+    land_sm = sm if om_small is None else sm.copy()
+    if om_small is not None:
+        land_sm[om_small] = np.nan
+    lo = float(np.nanmin(land_sm))
+    hi = float(np.nanmax(land_sm))
+    if hi <= lo:
+        hi = lo + 1.0
+    gray = np.clip((sm - lo) / (hi - lo), 0.0, 1.0)
+    gray_u8 = (gray * 255).astype(np.uint8)
+    if om_small is not None:
+        gray_u8[om_small] = 0  # ocean = black
+    print("done")
+    gray_img = Image.fromarray(gray_u8, "L")
+    gray_img = gray_img.filter(ImageFilter.SMOOTH_MORE)
+    gray_img = gray_img.filter(ImageFilter.SMOOTH)
+    gray_img.save(gray_path)
+    print(f"  Saved -> {gray_path}")
+
     return img
