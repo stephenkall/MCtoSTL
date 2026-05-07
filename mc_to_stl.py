@@ -115,7 +115,6 @@ def _ask(prompt: str, default: Any, cast, minimum=None) -> Any:
 
 def _ask_float(p, d, mn=1e-9):  return _ask(p, d, float, mn)
 def _ask_int(p, d, mn=1):       return _ask(p, d, int,   mn)
-def _ask_str(p, d=""):          return _ask(p, d, str)
 
 
 def _ask_bool(prompt: str, default: bool = True) -> bool:
@@ -267,25 +266,28 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
             d("min_land_area", 2_000), mn=0,
         )
 
-    print("  Sea masking polygons: JSON file with areas to force to sea level.")
-    print("  Format: [[[x,z],...], ...] OR legacy [{\"coordinates\":[[x,z],...]}]")
-    print("  Leave blank to keep existing inline polygons (if any) or skip.")
-    _sea_masking_file = _ask_str("Sea masking JSON file path (blank to skip/keep)", "")
-    if _sea_masking_file and os.path.isfile(_sea_masking_file):
-        with open(_sea_masking_file, encoding="utf-8") as _f:
-            _raw_polys = json.load(_f)
-        sea_masking: List = []
-        for _poly in _raw_polys:
-            if isinstance(_poly, dict):
-                sea_masking.append(_poly.get("coordinates", []))
-            else:
-                sea_masking.append(_poly)
-        print(f"  Loaded {len(sea_masking)} polygon(s) from {_sea_masking_file}")
-    elif _sea_masking_file:
-        print(f"  File not found: {_sea_masking_file}")
-        sea_masking = d("sea_masking", []) or []
-    else:
-        sea_masking = d("sea_masking", []) or []
+    # In unattended mode, always use inline sea_masking from the config.
+    # In interactive mode, optionally load / replace from a file.
+    sea_masking: List = d("sea_masking", []) or []
+    if not _ctx["unattended"]:
+        print("  Sea masking polygons: JSON file with areas to force to sea level.")
+        print("  Format: [[[x,z],...], ...] OR legacy [{\"coordinates\":[[x,z],...]}]")
+        print("  Leave blank to keep existing inline polygons (if any) or skip.")
+        _sea_masking_file = input("  Sea masking JSON file path (blank to skip/keep): ").strip()
+        if _sea_masking_file and os.path.isfile(_sea_masking_file):
+            with open(_sea_masking_file, encoding="utf-8") as _f:
+                _raw_polys = json.load(_f)
+            sea_masking = []
+            for _poly in _raw_polys:
+                if isinstance(_poly, dict):
+                    sea_masking.append(_poly.get("coordinates", []))
+                else:
+                    sea_masking.append(_poly)
+            print(f"  Loaded {len(sea_masking)} polygon(s) from {_sea_masking_file}")
+        elif _sea_masking_file:
+            print(f"  File not found: {_sea_masking_file} — keeping existing polygons.")
+        elif sea_masking:
+            print(f"  Keeping {len(sea_masking)} existing inline polygon(s).")
 
     # ── Java-only: floating block removal ────────────────────────────────
     if not is_bedrock:
