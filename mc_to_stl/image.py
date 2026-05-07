@@ -75,20 +75,17 @@ def _build_rgb(
 
     # ── Positive (land above sea): green → red ────────────────────────────
     pos = rel_g >= 0
-    # Exclude ocean pixels from land statistics — they sit at rel_g=0 and
-    # would inflate the low end of the distribution, biasing the percentile.
-    land_pos = pos & (~ocean_mask if ocean_mask is not None else pos)
-    if land_pos.any():
-        t = _percentile_norm(rel_g[land_pos], lo_pct=0.0, hi_pct=100.0)
+    if pos.any():
+        t = _percentile_norm(rel_g[pos], lo_pct=0.0, hi_pct=98.0)
         t_grid = np.zeros((rows, cols), dtype=np.float32)
-        t_grid[land_pos] = t
+        t_grid[pos] = t
         out[..., 0] = (t_grid * 255).astype(np.uint8)
         out[..., 1] = ((1.0 - t_grid) * 255).astype(np.uint8)
 
     # ── Negative (below sea level): blue → green ──────────────────────────
     neg = ~pos
     if neg.any():
-        t = _percentile_norm(-rel_g[neg], lo_pct=0.0, hi_pct=100.0)
+        t = _percentile_norm(-rel_g[neg], lo_pct=0.0, hi_pct=98.0)
         t_grid = np.zeros((rows, cols), dtype=np.float32)
         t_grid[neg] = t
         out[neg, 1] = ((1.0 - t_grid[neg]) * 255).astype(np.uint8)
