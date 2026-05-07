@@ -301,6 +301,10 @@ def apply_polygon_masks(
         c_min = max(0, int(pts[:, 1].min()))
         c_max = min(cols - 1, int(pts[:, 1].max()))
 
+        if r_max < r_min or c_max < c_min:
+            print(f"    Warning: polygon entirely outside heightmap bounds — skipped.")
+            continue
+
         rr, cc = np.mgrid[r_min:r_max + 1, c_min:c_max + 1]
         grid_pts = np.column_stack([rr.ravel(), cc.ravel()])
         inside = tri.find_simplex(grid_pts) >= 0

@@ -420,9 +420,8 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         print("\n[Resume] Loading cached processed heightmap …")
         hm_work, ocean_mask = cp.load_work_heightmap()
         if hm_work is not None:
-            # Restore sea level values that were resolved during a previous run
-            # (needed by stage_image even when processing is skipped).
-            for key in ("sea_level", "_effective_sea_level"):
+            # Restore values resolved during a previous run.
+            for key in ("sea_level", "_effective_sea_level", "_min_cx", "_min_cz"):
                 if params.get(key) is None and cp.params.get(key) is not None:
                     params[key] = cp.params[key]
             return hm_work, ocean_mask
@@ -506,6 +505,8 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         )
 
     cp.save_work_heightmap(hm_work, ocean_mask)
+    # Downstream outputs (image, STL, tiles) are now stale — force regeneration.
+    cp.unmark_from("image")
     # Raw heightmap is intentionally kept (heightmap_raw.npy) so the user can
     # re-run with different ocean/image params without re-parsing region files.
     return hm_work, ocean_mask
