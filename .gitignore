@@ -4,3 +4,4 @@ __pycache__/
 mc_output/
 *.stl
 *.png
+decomp/

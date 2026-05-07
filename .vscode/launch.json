@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: mc_to_stl config",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mc_to_stl.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--config=C:\\Minecraft\\WesterosEssos16k\\output\\config.json"
+            ]
+        }
+    ]
+}
