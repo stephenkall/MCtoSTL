@@ -449,14 +449,17 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         params["sea_level"] = sea_level
         cp.set_params(params)
 
-    # effective_sea_level lowers the ocean threshold so the continental shelf
-    # is exposed as terrain; ocean cells are flattened to effective_sea_level
-    # (the resin basin depth = offset * z_scale mm).
+    # sea_level_offset controls the STL basin depth only:
+    #   - Ocean DETECTION uses sea_level (original) so all surface water is
+    #     correctly masked regardless of the drain offset.
+    #   - Ocean FLATTENING uses effective_sea_level so the printed basin is
+    #     offset blocks lower than sea level — fill with resin to restore.
     sea_level_offset = int(params.get("sea_level_offset", 0))
     effective_sea_level = sea_level - sea_level_offset
 
     if sea_level_offset > 0:
-        print(f"  Sea level: Y={sea_level}  (draining {sea_level_offset} blocks → effective Y={effective_sea_level})")
+        print(f"  Sea level: Y={sea_level}  "
+              f"(STL basin floor Y={effective_sea_level}, fill {sea_level_offset}-block gap with resin)")
     else:
         print(f"  Sea level: Y={sea_level}")
     print(f"  Map size : {hm_raw.shape[1]:,} × {hm_raw.shape[0]:,} blocks "
@@ -469,7 +472,7 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
         t0 = time.perf_counter()
         ocean_mask = build_ocean_mask(
             hm_raw,
-            sea_level=effective_sea_level,
+            sea_level=sea_level,          # detect at real sea level
             min_ocean_blocks=params["min_ocean_blocks"],
         )
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
@@ -481,17 +484,17 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
             before = int(ocean_mask.sum())
             ocean_mask = remove_micro_islands(
                 hm_raw, ocean_mask,
-                sea_level=effective_sea_level,
+                sea_level=sea_level,      # detect at real sea level
                 min_land_area=params["min_land_area"],
             )
             removed = int(ocean_mask.sum()) - before
             print(f"    → {removed:,} block(s) absorbed  ({time.perf_counter()-t1:.1f}s)")
 
+        # Flatten to effective_sea_level so the STL basin is offset blocks deeper.
         hm_work = apply_ocean_mask(hm_raw, ocean_mask, sea_level=effective_sea_level)
     else:
         hm_work = hm_raw.copy()
 
-    # Save effective_sea_level so stage_image can use it for colour mapping
     params["_effective_sea_level"] = effective_sea_level
     cp.set_params(params)
 
@@ -505,13 +508,12 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
             params.get("_min_cz", 0) * 16,
         )
         print(f"    World origin  : block X={world_origin[0]}, Z={world_origin[1]}")
-        print(f"    Map size      : {hm_work.shape[1]:,} × {hm_work.shape[0]:,} blocks")
         if ocean_mask is not None:
             print(f"    Ocean before  : {100.0*ocean_mask.sum()/ocean_mask.size:.1f}%")
         else:
             print(f"    Ocean before  : (no ocean mask — mask_ocean is off)")
         hm_work, ocean_mask = apply_polygon_masks(
-            hm_work, ocean_mask, polygons, sea_level, world_origin,
+            hm_work, ocean_mask, polygons, effective_sea_level, world_origin,
         )
         if ocean_mask is not None:
             print(f"    Ocean after   : {100.0*ocean_mask.sum()/ocean_mask.size:.1f}%")
@@ -534,15 +536,16 @@ def stage_image(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         print("\n[Resume] Grayscale image missing — regenerating.")
         cp.unmark("image")
     _sec("Heightmap Image")
-    _sl  = params.get("sea_level") or 0
-    _off = params.get("sea_level_offset", 0) or 0
-    eff_sl = float(_sl) - float(_off)
+    _sl = params.get("sea_level") or 0
     img_path = os.path.join(params["out_dir"], "heightmap.png")
+    # Use original sea_level as colour reference — ocean cells in hm_work sit
+    # at effective_sea_level (≤ sea_level) and are overridden to steel-blue by
+    # the ocean_mask, so the image always shows the real coastline.
     generate_image(
         hm_work,
         params["max_px_w"], params["max_px_h"],
         params["smooth_sigma"], img_path,
-        sea_level=float(eff_sl),
+        sea_level=float(_sl),
         ocean_mask=ocean_mask,
         gamma=params["gamma"],
     )
