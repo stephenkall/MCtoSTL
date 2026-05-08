@@ -62,6 +62,7 @@ def build_ocean_mask(
     sea_level: int,
     min_ocean_blocks: int = 500_000,
     margin_blocks: int = 0,
+    water_map: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Return boolean mask: True = open sea.
@@ -75,9 +76,18 @@ def build_ocean_mask(
                        Set to 0 to use border-connectivity only.
     margin_blocks    : Erode the ocean mask inward by this many blocks so
                        shallow coastal pixels are kept as land.
+    water_map        : Optional bool array (same shape as heightmap).
+                       If provided, only pixels where water_map==True are
+                       candidates for ocean, preventing land depressions from
+                       being marked as water.
     """
     rows, cols = heightmap.shape
+    # Start with altitude-based candidate
     candidate = heightmap <= sea_level
+    # If water_map provided, filter: only keep pixels that are both
+    # (1) below/at sea level AND (2) actually water blocks
+    if water_map is not None:
+        candidate = candidate & water_map
     water_px = int(candidate.sum())
     print(f"    Water pixels (≤ Y={sea_level}): {water_px:,} of {rows*cols:,}  "
           f"({100.0*water_px/(rows*cols):.1f}%)")

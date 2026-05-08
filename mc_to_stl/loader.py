@@ -28,7 +28,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 from tqdm import tqdm
 
-from .anvil import parse_region, diagnose_region
+from .anvil import parse_region, parse_region_with_water, diagnose_region
 from .bedrock import parse_bedrock_world, diagnose_bedrock_world
 
 
@@ -190,15 +190,20 @@ def _crop_to_polygon(
     return cropped, new_meta, crop_mask
 
 
-def _parse_worker(args: Tuple) -> Tuple[str, Dict]:
+def _parse_worker(args: Tuple) -> Tuple[str, Dict, Optional[Dict]]:
     """
     Worker entry point.  Runs in a subprocess.
-    Returns (filepath, chunks_dict) so the caller can identify the result.
+    Returns (filepath, chunks_dict, water_dict_or_none).
     """
-    filepath, debug, ground_only, detect_floating, force_scan = args
-    chunks = parse_region(filepath, debug=debug, ground_only=ground_only,
-                          detect_floating=detect_floating, force_scan=force_scan)
-    return filepath, chunks
+    filepath, debug, ground_only, detect_floating, force_scan, detect_water = args
+    if detect_water:
+        chunks, water = parse_region_with_water(filepath, debug=debug, ground_only=ground_only,
+                                                detect_floating=detect_floating, force_scan=force_scan)
+        return filepath, chunks, water
+    else:
+        chunks = parse_region(filepath, debug=debug, ground_only=ground_only,
+                              detect_floating=detect_floating, force_scan=force_scan)
+        return filepath, chunks, None
 
 
 # ── Heightmap assembly (shared by both editions) ──────────────────────────────
@@ -239,6 +244,25 @@ def _assemble_heightmap(
         "min_cz": min_cz, "max_cz": max_cz,
     }
     return heightmap, meta
+
+
+def _assemble_water_map(
+    all_water_chunks: Dict[Tuple[int, int], np.ndarray],
+    meta: Dict,
+) -> np.ndarray:
+    """Stitch chunk water maps into one 2-D bool array using metadata from heightmap."""
+    min_cx = meta["min_cx"]
+    min_cz = meta["min_cz"]
+    width_blocks = meta["width_blocks"]
+    height_blocks = meta["height_blocks"]
+
+    water_map = np.zeros((height_blocks, width_blocks), dtype=bool)
+    for (cx, cz), chunk_water in all_water_chunks.items():
+        row = (cz - min_cz) * 16
+        col = (cx - min_cx) * 16
+        water_map[row:row+16, col:col+16] = chunk_water
+
+    return water_map
 
 
 # ── Bedrock loader ────────────────────────────────────────────────────────────
@@ -292,7 +316,9 @@ def load_save(
     detect_floating: bool = False,
     force_scan: bool = False,
     crop_poly: Optional[List] = None,
-) -> Tuple[np.ndarray, Dict, Optional[np.ndarray]]:
+    return_crop_mask: bool = False,
+    detect_water_blocks: bool = False,
+) -> Tuple:
     """
     Load a Minecraft save (Java or Bedrock Edition) into a heightmap array.
 
@@ -315,6 +341,7 @@ def load_save(
     -------
     heightmap : np.ndarray  shape (Z_blocks, X_blocks), float32
     meta      : dict  width_blocks, height_blocks, chunk extents, format
+    crop_mask : returned as a third value only when return_crop_mask=True
     """
     crop_mask: Optional[np.ndarray] = None
     if force_scan:
@@ -322,7 +349,7 @@ def load_save(
     fmt = detect_save_format(save_path)
     if fmt == "bedrock":
         hm, meta = _load_bedrock(save_path, out_dir, debug, use_cache)
-        return hm, meta, None
+        return (hm, meta, None) if return_crop_mask else (hm, meta)
 
     # ── Java Edition ──────────────────────────────────────────────────────
     region_path = find_region_dir(save_path)
@@ -379,9 +406,10 @@ def load_save(
               f"({len(mca_files) - len(to_parse)} region files skipped)")
 
     # ── Parse uncached files in parallel ──────────────────────────────────
+    all_water_chunks: Dict[Tuple[int, int], np.ndarray] = {} if detect_water_blocks else {}
     if to_parse:
         print(f"  Parsing {len(to_parse)} region file(s) with {n_workers} worker(s) …")
-        args_list = [(fp, debug, ground_only, detect_floating, force_scan) for fp in to_parse]
+        args_list = [(fp, debug, ground_only, detect_floating, force_scan, detect_water_blocks) for fp in to_parse]
 
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_parse_worker, a): a[0] for a in args_list}
@@ -396,13 +424,16 @@ def load_save(
                     fp = futures[future]
                     fname = os.path.basename(fp)
                     try:
-                        _, chunks = future.result()
+                        _, chunks, water = future.result()
                     except Exception as exc:
                         chunks = {}
+                        water = None
                         if debug:
                             tqdm.write(f"  Warning [{fname}]: {exc}")
 
                     all_chunks.update(chunks)
+                    if detect_water_blocks and water:
+                        all_water_chunks.update(water)
 
                     # Write cache from main process (safe, single-writer)
                     if use_cache and out_dir and chunks:
@@ -423,10 +454,18 @@ def load_save(
     meta["region_path"] = region_path
     meta["format"] = "java"
 
+    water_map = None
+    if detect_water_blocks and all_water_chunks:
+        water_map = _assemble_water_map(all_water_chunks, meta)
+
     if crop_poly is not None:
         crop_arr = np.array(crop_poly, dtype=np.float64)
         print(f"  Applying crop polygon …", end=" ", flush=True)
         hm, meta, crop_mask = _crop_to_polygon(hm, meta, crop_arr)
         print(f"done  ({meta['width_blocks']} × {meta['height_blocks']} blocks)")
 
-    return hm, meta, crop_mask
+    # Return format: (hm, meta, crop_mask_or_water_or_both)
+    if return_crop_mask:
+        return (hm, meta, crop_mask) if not detect_water_blocks else (hm, meta, crop_mask, water_map)
+    else:
+        return (hm, meta, water_map) if detect_water_blocks else (hm, meta)

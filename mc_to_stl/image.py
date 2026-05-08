@@ -170,7 +170,7 @@ def generate_image(
     else:
         rel_min = rel_max = 0.0
     print(f"  Land range   : {rel_min:+.0f} .. {rel_max:+.0f}  (relative to sea)")
-    print(f"  Gray stretch : Y={lo:.0f} → black,  Y={hi:.0f} → white  (global min–max)")
+    print(f"  Gray stretch : Y={lo:.0f} -> black,  Y={hi:.0f} -> white  (global min-max)")
     if ocean_mask is not None:
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
         print(f"  Ocean cover  : {pct:.1f}%")

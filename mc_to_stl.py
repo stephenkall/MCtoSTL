@@ -233,8 +233,15 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         print("                        (uses MOTION_BLOCKING_NO_LEAVES or scans sections)")
         print("  ground_only = NO   →  use WORLD_SURFACE (faster, includes everything)")
         ground_only = _ask_bool("Ground-only heightmap?", default=d("ground_only", True))
+
+        print("\n  Water block detection:")
+        print("  detect_water_blocks = YES  →  identify actual water blocks, prevents land")
+        print("                               depressions below sea level from being marked as water")
+        print("  detect_water_blocks = NO   →  faster, uses only altitude (default)")
+        detect_water_blocks = _ask_bool("Detect water blocks?", default=d("detect_water_blocks", False))
     else:
         ground_only = False  # Bedrock Data2D is always surface (no filtering option)
+        detect_water_blocks = False
 
     _sec("Anti-aliasing  (Gaussian blur — applied to all outputs)")
     print("  Recommended: 1.0–2.0  |  0 = none  |  higher = smoother")
@@ -370,6 +377,9 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         "Sea level drain (blocks, 0 = use actual sea level)",
         d("sea_level_offset", 0), mn=0,
     )
+    print("  Resin border: 0 = none; >0 adds that many wall layers around the whole model.")
+    print("  The total model size, including the border, stays within Max X/Y.")
+    border_width = _ask_int("Border width (mesh layers)", d("border_width", 0), mn=0)
 
     _sec("STL Mesh Resolution")
     print("  Max vertices on the longest side.  Higher = more detail but larger file.")
@@ -391,6 +401,7 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         save_path=save_path, out_dir=out_dir,
         n_workers=n_workers,
         ground_only=ground_only,
+        detect_water_blocks=detect_water_blocks,
         smooth_sigma=smooth_sigma,
         mask_ocean=mask_ocean,
         sea_level=sea_level,
@@ -409,6 +420,7 @@ def collect_params(saved: Dict = None, unattended: bool = False) -> Dict:
         z_exaggeration=z_exaggeration,
         base_mm=base_mm,
         sea_level_offset=sea_level_offset,
+        border_width=border_width,
         max_verts=max_verts,
         tile_x_mm=tile_x_mm, tile_y_mm=tile_y_mm,
         skip_ocean_stl=skip_ocean_stl,
@@ -454,7 +466,7 @@ def _invalidate_stale_stages(cp: Checkpoint, params: Dict) -> None:
                    "min_ocean_blocks", "min_land_area", "sea_masking"}
     IMG_KEYS    = {"smooth_sigma", "max_px_w", "max_px_h", "rectangular_crop"}
     STL_KEYS    = {"smooth_sigma", "max_x_mm", "max_y_mm", "z_exaggeration",
-                   "base_mm", "max_verts"}
+                   "base_mm", "border_width", "max_verts"}
     MOSAIC_KEYS = {"tile_x_mm", "tile_y_mm", "skip_ocean_stl"}
 
     msgs = []
@@ -490,8 +502,9 @@ def _invalidate_stale_stages(cp: Checkpoint, params: Dict) -> None:
 # ─── Processing stages ────────────────────────────────────────────────────────
 
 def stage_load(cp: Checkpoint, params: Dict):
-    """Load or resume heightmap from save. Returns (hm, crop_mask)."""
+    """Load or resume heightmap from save. Returns (hm, crop_mask, water_map)."""
     _crop_mask_path = os.path.join(params.get("out_dir", ""), ".crop_mask.npy")
+    _water_map_path = os.path.join(params.get("out_dir", ""), ".water_map.npy")
 
     if cp.is_done("loaded"):
         print("\n[Resume] Loading cached heightmap …")
@@ -506,13 +519,18 @@ def stage_load(cp: Checkpoint, params: Dict):
             if os.path.exists(_crop_mask_path):
                 import numpy as _np
                 crop_mask = _np.load(_crop_mask_path)
-            return hm, crop_mask
+            water_map = None
+            if os.path.exists(_water_map_path):
+                import numpy as _np
+                water_map = _np.load(_water_map_path)
+            return hm, crop_mask, water_map
         print("  Cache missing — re-loading from save.")
 
     _sec("Loading Save")
     crop_poly = params.get("crop_area")  # list of [x,z] pairs or None
+    detect_water = params.get("detect_water_blocks", False)
     try:
-        hm, meta, crop_mask = load_save(
+        result = load_save(
             params["save_path"],
             out_dir=params["out_dir"],
             ground_only=params["ground_only"],
@@ -521,7 +539,15 @@ def stage_load(cp: Checkpoint, params: Dict):
             detect_floating=params.get("detect_floating", False),
             force_scan=params.get("force_scan", False),
             crop_poly=crop_poly,
+            return_crop_mask=True,
+            detect_water_blocks=detect_water,
         )
+        # Unpack based on return type
+        if detect_water:
+            hm, meta, crop_mask, water_map = result
+        else:
+            hm, meta, crop_mask = result
+            water_map = None
     except (FileNotFoundError, ValueError) as exc:
         print(f"\n  ✗  {exc}")
         print("  Tip: run with --diagnose to inspect the save format.")
@@ -536,10 +562,13 @@ def stage_load(cp: Checkpoint, params: Dict):
     if crop_mask is not None:
         import numpy as _np
         _np.save(_crop_mask_path, crop_mask)
-    return hm, crop_mask
+    if water_map is not None:
+        import numpy as _np
+        _np.save(_water_map_path, water_map)
+    return hm, crop_mask, water_map
 
 
-def stage_process(cp: Checkpoint, params: Dict, hm_raw):
+def stage_process(cp: Checkpoint, params: Dict, hm_raw, water_map=None):
     """Apply ocean masking, island filtering, and polygon masks."""
     if cp.is_done("processed"):
         print("\n[Resume] Loading cached processed heightmap …")
@@ -603,6 +632,7 @@ def stage_process(cp: Checkpoint, params: Dict, hm_raw):
             hm_raw,
             sea_level=sea_level,          # detect at real sea level
             min_ocean_blocks=params["min_ocean_blocks"],
+            water_map=water_map,           # filter by actual water blocks if available
         )
         pct = 100.0 * ocean_mask.sum() / ocean_mask.size
         print(f"    → {pct:.1f}% ocean  ({time.perf_counter()-t0:.1f}s total)")
@@ -687,6 +717,9 @@ def stage_stl(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         z_exaggeration=params.get("z_exaggeration", 1.0),
         max_vertices=params["max_verts"],
         ocean_mask=ocean_mask,
+        sea_level=params.get("sea_level"),
+        sea_level_offset=params.get("sea_level_offset", 0),
+        border_width=params.get("border_width", 0),
     )
     cp.mark_done("stl")
 
@@ -707,6 +740,9 @@ def stage_mosaic(cp: Checkpoint, params: Dict, hm_work, ocean_mask):
         existing_tiles=existing,
         ocean_mask=ocean_mask,
         skip_ocean=params.get("skip_ocean_stl", False),
+        sea_level=params.get("sea_level"),
+        sea_level_offset=params.get("sea_level_offset", 0),
+        border_width=params.get("border_width", 0),
     )
     cp.mark_done("mosaic")
 
@@ -797,8 +833,8 @@ def main() -> None:
     print(f"  Starting conversion — outputs → {out_dir}/")
     print(f"{'═' * 62}")
 
-    hm_raw, crop_mask = stage_load(cp, params)
-    hm_work, ocean_mask = stage_process(cp, params, hm_raw)
+    hm_raw, crop_mask, water_map = stage_load(cp, params)
+    hm_work, ocean_mask = stage_process(cp, params, hm_raw, water_map=water_map)
     if params.get("generate_heightmap", True):
         stage_image(cp, params, hm_work, ocean_mask, crop_mask=crop_mask)
     else:
