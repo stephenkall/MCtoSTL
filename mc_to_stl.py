@@ -848,10 +848,22 @@ def main() -> None:
         stage_stl(cp, params, hm_work, ocean_mask)
     else:
         print("\n[Skip] Single STL generation disabled by config.")
-    if params.get("generate_mosaic", True):
+
+    # Skip mosaic if single STL fits within tile dimensions
+    generate_mosaic = params.get("generate_mosaic", True)
+    if generate_mosaic:
+        stl_w = params.get("max_x_mm", 200.0)
+        stl_h = params.get("max_y_mm", 200.0)
+        tile_w = params.get("tile_x_mm", 100.0)
+        tile_h = params.get("tile_y_mm", 100.0)
+        if stl_w <= tile_w and stl_h <= tile_h:
+            print("\n[Skip] Single STL fits within tile dimensions — mosaic generation skipped.")
+            generate_mosaic = False
+
+    if generate_mosaic:
         stage_mosaic(cp, params, hm_work, ocean_mask)
     else:
-        print("\n[Skip] Mosaic STL generation disabled by config.")
+        print("\n[Skip] Mosaic STL generation disabled by config.") if not params.get("generate_mosaic", True) else None
     # Intermediate .npy files (heightmap_raw, heightmap_work, ocean_mask) are
     # intentionally kept so that re-running with changed sigma / gamma / z-scale
     # regenerates only the affected outputs without re-parsing region files.
