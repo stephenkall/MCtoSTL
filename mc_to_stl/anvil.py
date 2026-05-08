@@ -391,22 +391,22 @@ def _water_map_from_sections(
             else:
                 continue
 
-            # Check each column
+            # Check each column.
+            # heightmap[z,x] = Y+1 of surface block (Minecraft convention: first
+            # air above).  Subtract 1 to get the actual surface block Y.
+            y_min = sy * 16
+            y_max = y_min + 16
             for z in range(16):
                 for x in range(16):
-                    y_global = int(heightmap[z, x])
-                    if y_global <= 0:
+                    block_y = int(heightmap[z, x]) - 1  # actual surface block
+                    if block_y < 0:
                         continue
-                    # Check if this Y is in this section
-                    y_min = sy * 16
-                    y_max = y_min + 16
-                    if not (y_min <= y_global < y_max):
+                    if not (y_min <= block_y < y_max):
                         continue
-                    y_local = y_global - y_min
-                    if 0 <= y_local < 16:
-                        block_id = int(blocks_3d[y_local, z, x])
-                        if block_id < len(water_flags) and water_flags[block_id]:
-                            is_water[z, x] = True
+                    y_local = block_y - y_min
+                    block_id = int(blocks_3d[y_local, z, x])
+                    if block_id < len(water_flags) and water_flags[block_id]:
+                        is_water[z, x] = True
         except Exception:
             continue
 
