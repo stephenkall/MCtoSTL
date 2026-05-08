@@ -144,8 +144,15 @@ def _crop_to_polygon(
     heightmap: np.ndarray,
     meta: Dict,
     crop_poly: np.ndarray,
-) -> Tuple[np.ndarray, Dict]:
-    """Crop heightmap to bounding box of crop_poly; pixels outside polygon set to global min."""
+    extra_bool_maps: Optional[List[Optional[np.ndarray]]] = None,
+) -> Tuple:
+    """
+    Crop heightmap to bounding box of crop_poly; pixels outside polygon set to global min.
+
+    extra_bool_maps: optional list of boolean arrays (same shape as heightmap) to crop
+                     in sync. Outside-polygon pixels are set to False.
+                     Returns them as extra elements appended to the result tuple.
+    """
     min_cx = meta["min_cx"]
     min_cz = meta["min_cz"]
 
@@ -187,7 +194,17 @@ def _crop_to_polygon(
         "min_cz": new_min_cz,
         "max_cz": new_min_cz + (rows_c + 15) // 16 - 1,
     }
-    return cropped, new_meta, crop_mask
+
+    result = (cropped, new_meta, crop_mask)
+    if extra_bool_maps is not None:
+        for arr in extra_bool_maps:
+            if arr is None:
+                result += (None,)
+            else:
+                extra = arr[row0:row1, col0:col1].copy()
+                extra[outside] = False
+                result += (extra,)
+    return result
 
 
 def _parse_worker(args: Tuple) -> Tuple[str, Dict, Optional[Dict]]:
@@ -461,7 +478,9 @@ def load_save(
     if crop_poly is not None:
         crop_arr = np.array(crop_poly, dtype=np.float64)
         print(f"  Applying crop polygon …", end=" ", flush=True)
-        hm, meta, crop_mask = _crop_to_polygon(hm, meta, crop_arr)
+        hm, meta, crop_mask, water_map = _crop_to_polygon(
+            hm, meta, crop_arr, extra_bool_maps=[water_map]
+        )
         print(f"done  ({meta['width_blocks']} × {meta['height_blocks']} blocks)")
 
     # Return format: (hm, meta, crop_mask_or_water_or_both)

@@ -522,7 +522,12 @@ def stage_load(cp: Checkpoint, params: Dict):
             water_map = None
             if os.path.exists(_water_map_path):
                 import numpy as _np
-                water_map = _np.load(_water_map_path)
+                wm = _np.load(_water_map_path)
+                # Only use if shape matches (old cache may have pre-crop shape)
+                if wm.shape == hm.shape:
+                    water_map = wm
+                else:
+                    print(f"  Note: cached water_map shape {wm.shape} != heightmap {hm.shape}; ignoring.")
             return hm, crop_mask, water_map
         print("  Cache missing — re-loading from save.")
 
