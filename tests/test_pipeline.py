@@ -133,6 +133,25 @@ class TestFullPipeline(unittest.TestCase):
             n = np.cross(v1 - v0, v2 - v0)
             self.assertGreater(np.linalg.norm(n), 1e-10)
 
+    def test_single_stl_border_keeps_requested_size(self):
+        hm, _ = load_save(self.save_dir)
+        no_border_path = os.path.join(self.out_dir, "terrain_no_border.stl")
+        border_path = os.path.join(self.out_dir, "terrain_border.stl")
+
+        generate_single_stl(hm, max_x_mm=100, max_y_mm=100, max_z_mm=10,
+                            base_mm=2, smooth_sigma=0.0,
+                            output_path=no_border_path)
+        generate_single_stl(hm, max_x_mm=100, max_y_mm=100, max_z_mm=10,
+                            base_mm=2, smooth_sigma=0.0,
+                            output_path=border_path, border_width=3)
+
+        no_border_verts = np.array([v for t in self._read_stl(no_border_path) for v in t])
+        border_verts = np.array([v for t in self._read_stl(border_path) for v in t])
+
+        self.assertAlmostEqual(border_verts[:, 0].max(), 100.0, delta=0.5)
+        self.assertAlmostEqual(border_verts[:, 1].max(), 100.0, delta=0.5)
+        self.assertGreater(border_verts[:, 2].max(), no_border_verts[:, 2].max())
+
     def test_mosaic_stl(self):
         hm, _ = load_save(self.save_dir)
         tiles_dir = os.path.join(self.out_dir, "tiles")
@@ -153,6 +172,42 @@ class TestFullPipeline(unittest.TestCase):
             all_verts = np.array([v for t in tris for v in t])
             self.assertAlmostEqual(all_verts[:, 2].min(), 0.0, delta=0.01,
                                    msg=f"{fname}: Z floor is not 0")
+
+    def test_mosaic_border_only_on_outer_tiles(self):
+        hm, _ = load_save(self.save_dir)
+        tiles_dir = os.path.join(self.out_dir, "tiles_border")
+        generate_mosaic_stl(hm, max_x_mm=100, max_y_mm=100, max_z_mm=10,
+                            tile_x_mm=40, tile_y_mm=40,
+                            base_mm=2, smooth_sigma=0.0,
+                            output_dir=tiles_dir, border_width=3)
+
+        tile_files = sorted(f for f in os.listdir(tiles_dir)
+                            if f.endswith(".stl"))
+        self.assertGreater(len(tile_files), 4)
+
+        coords = []
+        zmax = {}
+        for fname in tile_files:
+            _, tz, tx_stl = fname[:-4].split("_")
+            tx = int(tx_stl)
+            tz = int(tz)
+            coords.append((tz, tx))
+            tris = self._read_stl(os.path.join(tiles_dir, fname))
+            verts = np.array([v for t in tris for v in t])
+            zmax[(tz, tx)] = float(verts[:, 2].max())
+
+        max_tz = max(tz for tz, _ in coords)
+        max_tx = max(tx for _, tx in coords)
+        edge_heights = [
+            z for (tz, tx), z in zmax.items()
+            if tz in (0, max_tz) or tx in (0, max_tx)
+        ]
+        inner_heights = [
+            z for (tz, tx), z in zmax.items()
+            if tz not in (0, max_tz) and tx not in (0, max_tx)
+        ]
+        self.assertTrue(inner_heights)
+        self.assertGreater(max(edge_heights), max(inner_heights))
 
 
 if __name__ == "__main__":

@@ -124,6 +124,8 @@ class Checkpoint:
 
     # ── Stage flags ───────────────────────────────────────────────────────
 
+    _STAGE_ORDER = ["loaded", "processed", "image", "stl", "mosaic"]
+
     def is_done(self, stage: str) -> bool:
         return stage in self._state.get("done", [])
 
@@ -131,6 +133,23 @@ class Checkpoint:
         done = self._state.setdefault("done", [])
         if stage not in done:
             done.append(stage)
+        self.save()
+
+    def unmark(self, stage: str) -> None:
+        """Remove a single stage from the done list."""
+        done = self._state.get("done", [])
+        if stage in done:
+            done.remove(stage)
+        self.save()
+
+    def unmark_from(self, stage: str) -> None:
+        """Remove stage and all downstream stages from the done list."""
+        if stage not in self._STAGE_ORDER:
+            return
+        idx = self._STAGE_ORDER.index(stage)
+        to_remove = set(self._STAGE_ORDER[idx:])
+        self._state["done"] = [s for s in self._state.get("done", [])
+                                if s not in to_remove]
         self.save()
 
     # ── Heightmap I/O ─────────────────────────────────────────────────────

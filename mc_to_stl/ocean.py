@@ -29,7 +29,7 @@ with vectorized LUT indexing:
 """
 
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.ndimage import binary_dilation, binary_erosion, label
@@ -62,6 +62,7 @@ def build_ocean_mask(
     sea_level: int,
     min_ocean_blocks: int = 500_000,
     margin_blocks: int = 0,
+    water_map: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Return boolean mask: True = open sea.
@@ -75,9 +76,18 @@ def build_ocean_mask(
                        Set to 0 to use border-connectivity only.
     margin_blocks    : Erode the ocean mask inward by this many blocks so
                        shallow coastal pixels are kept as land.
+    water_map        : Optional bool array (same shape as heightmap).
+                       If provided, only pixels where water_map==True are
+                       candidates for ocean, preventing land depressions from
+                       being marked as water.
     """
     rows, cols = heightmap.shape
+    # Start with altitude-based candidate
     candidate = heightmap <= sea_level
+    # If water_map provided, filter: only keep pixels that are both
+    # (1) below/at sea level AND (2) actually water blocks
+    if water_map is not None:
+        candidate = candidate & water_map
     water_px = int(candidate.sum())
     print(f"    Water pixels (≤ Y={sea_level}): {water_px:,} of {rows*cols:,}  "
           f"({100.0*water_px/(rows*cols):.1f}%)")
@@ -249,3 +259,82 @@ def apply_ocean_mask(
     result = heightmap.copy()
     result[ocean_mask] = sea_level
     return result
+
+
+def apply_polygon_masks(
+    heightmap: np.ndarray,
+    ocean_mask: Optional[np.ndarray],
+    polygons: List,
+    sea_level: int,
+    world_origin: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For each polygon, set all heightmap cells inside its convex hull to
+    sea_level and mark them as ocean.
+
+    Parameters
+    ----------
+    polygons     : list of polygons, each polygon in one of two formats:
+                     new: [[x, z], [x, z], ...]
+                     old: {"coordinates": [[x, z], ...]}
+                   where x, z are Minecraft block coordinates.
+    sea_level    : Y value assigned to masked cells.
+    world_origin : (min_x_block, min_z_block) — Minecraft block coords that
+                   map to heightmap pixel (row=0, col=0).
+
+    Returns
+    -------
+    (heightmap_copy, ocean_mask_copy) with polygon areas modified.
+    """
+    from scipy.spatial import ConvexHull, Delaunay  # lazy import — not always needed
+
+    origin_x, origin_z = world_origin
+    rows, cols = heightmap.shape
+    result = heightmap.copy()
+    new_ocean = ocean_mask.copy() if ocean_mask is not None else np.zeros((rows, cols), dtype=bool)
+
+    total_masked = 0
+    for poly in polygons:
+        # Accept both new [[x,z],...] and old {"coordinates": [[x,z],...]} format
+        if isinstance(poly, dict):
+            coords = poly.get("coordinates", [])
+        else:
+            coords = poly
+        if len(coords) < 3:
+            continue
+
+        # Minecraft (x, z) → heightmap (row, col):  row = z − origin_z, col = x − origin_x
+        pts = np.array([[c[1] - origin_z, c[0] - origin_x] for c in coords], dtype=float)
+        print(f"      Coords sample (first 3): {coords[:3]}")
+        print(f"      Pixel bbox raw: row {pts[:,0].min():.0f}..{pts[:,0].max():.0f}, "
+              f"col {pts[:,1].min():.0f}..{pts[:,1].max():.0f}  "
+              f"(map is {rows}×{cols})")
+
+        try:
+            hull = ConvexHull(pts)
+            tri = Delaunay(pts[hull.vertices])
+        except Exception:
+            continue
+
+        r_min = max(0, int(pts[:, 0].min()))
+        r_max = min(rows - 1, int(pts[:, 0].max()))
+        c_min = max(0, int(pts[:, 1].min()))
+        c_max = min(cols - 1, int(pts[:, 1].max()))
+        print(f"      Pixel bbox clamped: rows {r_min}..{r_max}, cols {c_min}..{c_max}")
+
+        if r_max < r_min or c_max < c_min:
+            print(f"    Warning: polygon entirely outside heightmap bounds — skipped.")
+            continue
+
+        rr, cc = np.mgrid[r_min:r_max + 1, c_min:c_max + 1]
+        grid_pts = np.column_stack([rr.ravel(), cc.ravel()])
+        inside = tri.find_simplex(grid_pts) >= 0
+
+        r_in = rr.ravel()[inside]
+        c_in = cc.ravel()[inside]
+        result[r_in, c_in] = sea_level
+        new_ocean[r_in, c_in] = True
+        total_masked += int(inside.sum())
+
+    print(f"    {len(polygons)} polygon(s), {total_masked:,} block(s) forced to sea level.")
+    return result, new_ocean

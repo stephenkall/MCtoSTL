@@ -20,6 +20,7 @@ Cache layout (inside out_dir):
 import glob
 import multiprocessing
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
@@ -27,7 +28,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 from tqdm import tqdm
 
-from .anvil import parse_region, diagnose_region
+from .anvil import parse_region, parse_region_with_water, diagnose_region
 from .bedrock import parse_bedrock_world, diagnose_bedrock_world
 
 
@@ -123,15 +124,86 @@ def _save_cached_chunks(cache_file: str, chunks: Dict) -> None:
 
 # ── Worker function (must be module-level for pickling) ───────────────────────
 
-def _parse_worker(args: Tuple) -> Tuple[str, Dict]:
+def _points_in_polygon(xs: np.ndarray, zs: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Vectorised ray-casting point-in-polygon. poly: (N,2) float array of (x,z)."""
+    inside = np.zeros(xs.shape, dtype=bool)
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, zi = float(poly[i, 0]), float(poly[i, 1])
+        xj, zj = float(poly[j, 0]), float(poly[j, 1])
+        dz = zj - zi
+        cross = (zi > zs) != (zj > zs)
+        x_int = (xj - xi) * (zs - zi) / (dz if abs(dz) > 1e-12 else 1e-12) + xi
+        inside ^= cross & (xs < x_int)
+        j = i
+    return inside
+
+
+def _crop_to_polygon(
+    heightmap: np.ndarray,
+    meta: Dict,
+    crop_poly: np.ndarray,
+) -> Tuple[np.ndarray, Dict]:
+    """Crop heightmap to bounding box of crop_poly; pixels outside polygon set to global min."""
+    min_cx = meta["min_cx"]
+    min_cz = meta["min_cz"]
+
+    poly_x, poly_z = crop_poly[:, 0], crop_poly[:, 1]
+    bb_x0 = int(np.floor(poly_x.min()))
+    bb_x1 = int(np.ceil(poly_x.max()))
+    bb_z0 = int(np.floor(poly_z.min()))
+    bb_z1 = int(np.ceil(poly_z.max()))
+
+    rows_total, cols_total = heightmap.shape
+    col0 = max(0, bb_x0 - min_cx * 16)
+    col1 = min(cols_total, bb_x1 - min_cx * 16 + 1)
+    row0 = max(0, bb_z0 - min_cz * 16)
+    row1 = min(rows_total, bb_z1 - min_cz * 16 + 1)
+
+    if col0 >= col1 or row0 >= row1:
+        raise ValueError("Crop polygon is entirely outside the loaded map extent.")
+
+    cropped = heightmap[row0:row1, col0:col1].copy()
+    rows_c, cols_c = cropped.shape
+
+    block_x0 = min_cx * 16 + col0
+    block_z0 = min_cz * 16 + row0
+    xs_grid = np.tile(np.arange(cols_c, dtype=np.float32) + block_x0, (rows_c, 1))
+    zs_grid = np.tile((np.arange(rows_c, dtype=np.float32) + block_z0)[:, None], (1, cols_c))
+
+    outside = ~_points_in_polygon(xs_grid, zs_grid, crop_poly.astype(np.float32))
+    cropped[outside] = float(heightmap.min())
+    crop_mask = ~outside  # True = inside polygon
+
+    new_min_cx = min_cx + col0 // 16
+    new_min_cz = min_cz + row0 // 16
+    new_meta = {
+        **meta,
+        "width_blocks": cols_c,
+        "height_blocks": rows_c,
+        "min_cx": new_min_cx,
+        "max_cx": new_min_cx + (cols_c + 15) // 16 - 1,
+        "min_cz": new_min_cz,
+        "max_cz": new_min_cz + (rows_c + 15) // 16 - 1,
+    }
+    return cropped, new_meta, crop_mask
+
+
+def _parse_worker(args: Tuple) -> Tuple[str, Dict, Optional[Dict]]:
     """
     Worker entry point.  Runs in a subprocess.
-    Returns (filepath, chunks_dict) so the caller can identify the result.
+    Returns (filepath, chunks_dict, water_dict_or_none).
     """
-    filepath, debug, ground_only, detect_floating = args
-    chunks = parse_region(filepath, debug=debug, ground_only=ground_only,
-                          detect_floating=detect_floating)
-    return filepath, chunks
+    filepath, debug, ground_only, detect_floating, force_scan, detect_water = args
+    if detect_water:
+        chunks, water = parse_region_with_water(filepath, debug=debug, ground_only=ground_only,
+                                                detect_floating=detect_floating, force_scan=force_scan)
+        return filepath, chunks, water
+    else:
+        chunks = parse_region(filepath, debug=debug, ground_only=ground_only,
+                              detect_floating=detect_floating, force_scan=force_scan)
+        return filepath, chunks, None
 
 
 # ── Heightmap assembly (shared by both editions) ──────────────────────────────
@@ -172,6 +244,25 @@ def _assemble_heightmap(
         "min_cz": min_cz, "max_cz": max_cz,
     }
     return heightmap, meta
+
+
+def _assemble_water_map(
+    all_water_chunks: Dict[Tuple[int, int], np.ndarray],
+    meta: Dict,
+) -> np.ndarray:
+    """Stitch chunk water maps into one 2-D bool array using metadata from heightmap."""
+    min_cx = meta["min_cx"]
+    min_cz = meta["min_cz"]
+    width_blocks = meta["width_blocks"]
+    height_blocks = meta["height_blocks"]
+
+    water_map = np.zeros((height_blocks, width_blocks), dtype=bool)
+    for (cx, cz), chunk_water in all_water_chunks.items():
+        row = (cz - min_cz) * 16
+        col = (cx - min_cx) * 16
+        water_map[row:row+16, col:col+16] = chunk_water
+
+    return water_map
 
 
 # ── Bedrock loader ────────────────────────────────────────────────────────────
@@ -223,7 +314,11 @@ def load_save(
     use_cache: bool = True,
     n_workers: int = 0,
     detect_floating: bool = False,
-) -> Tuple[np.ndarray, Dict]:
+    force_scan: bool = False,
+    crop_poly: Optional[List] = None,
+    return_crop_mask: bool = False,
+    detect_water_blocks: bool = False,
+) -> Tuple:
     """
     Load a Minecraft save (Java or Bedrock Edition) into a heightmap array.
 
@@ -234,15 +329,27 @@ def load_save(
     use_cache      : Read/write chunk cache (default True).
     n_workers      : Java only — parallel worker processes (0 = all CPUs).
     detect_floating: Java only — remove floating block artefacts.
+    force_scan     : Java only — bypass stored Heightmaps NBT, always scan sections.
+                     Fixes stale heightmap values (holes in mountains) at the cost
+                     of slower parsing.  Automatically disables chunk cache.
+    crop_poly      : Optional list of 4 [x, z] corners (block coords) defining a
+                     quadrilateral region of interest.  Only blocks inside this
+                     polygon appear in the output; blocks outside are set to the
+                     global minimum height so ocean masking absorbs them.
 
     Returns
     -------
     heightmap : np.ndarray  shape (Z_blocks, X_blocks), float32
     meta      : dict  width_blocks, height_blocks, chunk extents, format
+    crop_mask : returned as a third value only when return_crop_mask=True
     """
+    crop_mask: Optional[np.ndarray] = None
+    if force_scan:
+        use_cache = False   # stale stored heightmaps → cached data would be wrong
     fmt = detect_save_format(save_path)
     if fmt == "bedrock":
-        return _load_bedrock(save_path, out_dir, debug, use_cache)
+        hm, meta = _load_bedrock(save_path, out_dir, debug, use_cache)
+        return (hm, meta, None) if return_crop_mask else (hm, meta)
 
     # ── Java Edition ──────────────────────────────────────────────────────
     region_path = find_region_dir(save_path)
@@ -250,6 +357,27 @@ def load_save(
 
     if not mca_files:
         raise FileNotFoundError(f"No .mca files found in '{region_path}'")
+
+    # ── Filter region files by crop polygon bounding box ─────────────────
+    if crop_poly is not None:
+        crop_arr = np.array(crop_poly, dtype=np.float64)
+        bb_x0 = int(np.floor(crop_arr[:, 0].min()))
+        bb_x1 = int(np.ceil(crop_arr[:, 0].max()))
+        bb_z0 = int(np.floor(crop_arr[:, 1].min()))
+        bb_z1 = int(np.ceil(crop_arr[:, 1].max()))
+        filtered = []
+        for fp in mca_files:
+            m = re.search(r"r\.(-?\d+)\.(-?\d+)\.mca$", fp)
+            if m is None:
+                continue
+            rx, rz = int(m.group(1)), int(m.group(2))
+            if (rx * 512 + 511 >= bb_x0 and rx * 512 <= bb_x1 and
+                    rz * 512 + 511 >= bb_z0 and rz * 512 <= bb_z1):
+                filtered.append(fp)
+        print(f"  Crop filter  : {len(filtered)}/{len(mca_files)} region files overlap crop polygon")
+        mca_files = filtered
+        if not mca_files:
+            raise ValueError("Crop polygon does not overlap any region files in this save.")
 
     if n_workers <= 0:
         n_workers = multiprocessing.cpu_count()
@@ -278,9 +406,10 @@ def load_save(
               f"({len(mca_files) - len(to_parse)} region files skipped)")
 
     # ── Parse uncached files in parallel ──────────────────────────────────
+    all_water_chunks: Dict[Tuple[int, int], np.ndarray] = {} if detect_water_blocks else {}
     if to_parse:
         print(f"  Parsing {len(to_parse)} region file(s) with {n_workers} worker(s) …")
-        args_list = [(fp, debug, ground_only, detect_floating) for fp in to_parse]
+        args_list = [(fp, debug, ground_only, detect_floating, force_scan, detect_water_blocks) for fp in to_parse]
 
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_parse_worker, a): a[0] for a in args_list}
@@ -295,13 +424,16 @@ def load_save(
                     fp = futures[future]
                     fname = os.path.basename(fp)
                     try:
-                        _, chunks = future.result()
+                        _, chunks, water = future.result()
                     except Exception as exc:
                         chunks = {}
+                        water = None
                         if debug:
                             tqdm.write(f"  Warning [{fname}]: {exc}")
 
                     all_chunks.update(chunks)
+                    if detect_water_blocks and water:
+                        all_water_chunks.update(water)
 
                     # Write cache from main process (safe, single-writer)
                     if use_cache and out_dir and chunks:
@@ -321,4 +453,19 @@ def load_save(
     hm, meta = _assemble_heightmap(all_chunks)
     meta["region_path"] = region_path
     meta["format"] = "java"
-    return hm, meta
+
+    water_map = None
+    if detect_water_blocks and all_water_chunks:
+        water_map = _assemble_water_map(all_water_chunks, meta)
+
+    if crop_poly is not None:
+        crop_arr = np.array(crop_poly, dtype=np.float64)
+        print(f"  Applying crop polygon …", end=" ", flush=True)
+        hm, meta, crop_mask = _crop_to_polygon(hm, meta, crop_arr)
+        print(f"done  ({meta['width_blocks']} × {meta['height_blocks']} blocks)")
+
+    # Return format: (hm, meta, crop_mask_or_water_or_both)
+    if return_crop_mask:
+        return (hm, meta, crop_mask) if not detect_water_blocks else (hm, meta, crop_mask, water_map)
+    else:
+        return (hm, meta, water_map) if detect_water_blocks else (hm, meta)

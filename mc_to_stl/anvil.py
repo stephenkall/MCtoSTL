@@ -164,6 +164,11 @@ def _get_block_name(palette_entry) -> str:
     return str(palette_entry.get("Name", "")) if hasattr(palette_entry, "get") else str(palette_entry)
 
 
+def _is_water(name: str) -> bool:
+    """Return True if this block is water (flowing or static)."""
+    return name in {"minecraft:water", "minecraft:flowing_water"}
+
+
 def _decode_section(
     section, ground_only: bool = False
 ) -> Optional[np.ndarray]:
@@ -334,6 +339,80 @@ def _heightmap_from_sections(
     return np.where(has_any, surface_y, np.int32(y_min))
 
 
+def _water_map_from_sections(
+    chunk,
+    heightmap: np.ndarray,
+) -> Optional[np.ndarray]:
+    """
+    Build a 16×16 bool map indicating which columns have water as the top block.
+
+    For each (x, z) column, checks the block type at the Y given by heightmap[z, x].
+    Returns True if that block is water, False otherwise.
+    """
+    sm = _section_map(chunk)
+    if sm is None:
+        return None
+
+    rows, cols = heightmap.shape
+    is_water = np.zeros((rows, cols), dtype=bool)
+
+    for sy in sorted(sm.keys()):
+        sec = sm[sy]
+        if sec is None:
+            continue
+        try:
+            # Extract palette
+            palette = None
+            if "block_states" in sec:
+                bs = sec.get("block_states", {})
+                palette = list(bs.get("palette", []))
+            elif "Palette" in sec:
+                palette = list(sec["Palette"])
+            if not palette:
+                continue
+            block_names = [_get_block_name(p) for p in palette]
+            water_flags = [_is_water(name) for name in block_names]
+
+            # Decode block states
+            if "block_states" in sec:
+                bs = sec["block_states"]
+                if "data" not in bs:
+                    # All blocks are palette[0]
+                    continue
+                longs = list(bs["data"])
+                bits = max(4, math.ceil(math.log2(max(len(palette), 2))))
+                block_ids = _unpack_longs(longs, bits, 4096)
+                blocks_3d = np.array(block_ids, dtype=np.uint16).reshape(16, 16, 16)
+            elif "BlockStates" in sec and "Palette" in sec:
+                longs = list(sec["BlockStates"])
+                bits = max(4, math.ceil(math.log2(max(len(palette), 2))))
+                block_ids = _unpack_longs(longs, bits, 4096)
+                blocks_3d = np.array(block_ids, dtype=np.uint16).reshape(16, 16, 16)
+            else:
+                continue
+
+            # Check each column
+            for z in range(16):
+                for x in range(16):
+                    y_global = int(heightmap[z, x])
+                    if y_global <= 0:
+                        continue
+                    # Check if this Y is in this section
+                    y_min = sy * 16
+                    y_max = y_min + 16
+                    if not (y_min <= y_global < y_max):
+                        continue
+                    y_local = y_global - y_min
+                    if 0 <= y_local < 16:
+                        block_id = int(blocks_3d[y_local, z, x])
+                        if block_id < len(water_flags) and water_flags[block_id]:
+                            is_water[z, x] = True
+        except Exception:
+            continue
+
+    return is_water
+
+
 # ── Per-chunk heightmap extraction ───────────────────────────────────────────
 
 # Heightmap key preference by mode
@@ -355,6 +434,7 @@ def _extract_heightmap(
     root: nbtlib.Compound,
     ground_only: bool = False,
     detect_floating: bool = False,
+    force_scan: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Extract a 16×16 int32 heightmap from a parsed chunk Compound.
@@ -364,11 +444,16 @@ def _extract_heightmap(
                           skips plants, wood, and decorative blocks
     detect_floating=True: always use section-based 3D connectivity analysis
                           (bypasses Heightmaps compound) to exclude floating blocks
+    force_scan=True:      always scan block sections, ignore stored Heightmaps.
+                          Use when the stored heightmap is stale (e.g. terrain was
+                          raised after the chunk was first generated in an older
+                          version).  Slower than reading stored values but matches
+                          what Unmined does.
     """
     chunk = root.get("Level", root)
 
-    # 3D floating-block detection requires section data — bypass stored heightmaps.
-    if not detect_floating:
+    # 3D floating-block detection and force_scan both require section data.
+    if not detect_floating and not force_scan:
         hm_keys = _HM_KEYS_GROUND if ground_only else _HM_KEYS_SURFACE
 
         # 1 ── New format: Heightmaps compound (1.13+) ────────────────────
@@ -403,6 +488,7 @@ def parse_region(
     debug: bool = False,
     ground_only: bool = False,
     detect_floating: bool = False,
+    force_scan: bool = False,
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """
     Parse a single .mca file.
@@ -464,7 +550,8 @@ def parse_region(
                 continue
 
             hm = _extract_heightmap(root, ground_only=ground_only,
-                                     detect_floating=detect_floating)
+                                     detect_floating=detect_floating,
+                                     force_scan=force_scan)
             if hm is None:
                 if debug:
                     chunk = root.get("Level", root)
@@ -480,6 +567,100 @@ def parse_region(
                 print(f"    [chunk {i}] exception: {exc}")
 
     return chunks
+
+
+def parse_region_with_water(
+    filepath: str,
+    debug: bool = False,
+    ground_only: bool = False,
+    detect_floating: bool = False,
+    force_scan: bool = False,
+) -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[Tuple[int, int], np.ndarray]]:
+    """
+    Parse a single .mca file, returning both heightmaps and water maps.
+
+    Returns:
+      (heightmaps, water_maps) where each is {(chunk_x, chunk_z): 16×16 array}
+      heightmaps: int32 height values
+      water_maps: bool arrays (True where top block is water)
+    """
+    heightmaps: Dict[Tuple[int, int], np.ndarray] = {}
+    water_maps: Dict[Tuple[int, int], np.ndarray] = {}
+
+    m = re.search(r"r\.(-?\d+)\.(-?\d+)\.mca$", filepath)
+    if m is None:
+        return heightmaps, water_maps
+    rx, rz = int(m.group(1)), int(m.group(2))
+
+    try:
+        with open(filepath, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return heightmaps, water_maps
+
+    if len(raw) < 8192:
+        return heightmaps, water_maps
+
+    for i in range(1024):
+        loc = struct.unpack_from(">I", raw, i * 4)[0]
+        sector_offset = loc >> 8
+        sector_count = loc & 0xFF
+        if sector_offset == 0 or sector_count == 0:
+            continue
+
+        byte_off = sector_offset * 4096
+        if byte_off + 5 > len(raw):
+            continue
+
+        data_len = struct.unpack_from(">I", raw, byte_off)[0]
+        compression = raw[byte_off + 4]
+        payload = raw[byte_off + 5 : byte_off + 4 + data_len]
+
+        if len(payload) < data_len - 1:
+            continue
+
+        try:
+            if compression == 1:
+                nbt_bytes = gzip.decompress(payload)
+            elif compression == 2:
+                nbt_bytes = zlib.decompress(payload)
+            elif compression == 3:
+                nbt_bytes = payload
+            else:
+                if debug:
+                    print(f"    [chunk {i}] unknown compression {compression}")
+                continue
+
+            root = _parse_nbt(nbt_bytes)
+            if root is None:
+                if debug:
+                    print(f"    [chunk {i}] NBT parse returned None")
+                continue
+
+            hm = _extract_heightmap(root, ground_only=ground_only,
+                                     detect_floating=detect_floating,
+                                     force_scan=force_scan)
+            if hm is None:
+                if debug:
+                    chunk = root.get("Level", root)
+                    print(f"    [chunk {i}] no heightmap; keys={list(chunk.keys())[:10]}")
+                continue
+
+            wm = _water_map_from_sections(root, hm)
+            if wm is None:
+                wm = np.zeros((16, 16), dtype=bool)
+
+            cx_local = i % 32
+            cz_local = i // 32
+            chunk_key = (rx * 32 + cx_local, rz * 32 + cz_local)
+            heightmaps[chunk_key] = hm
+            water_maps[chunk_key] = wm
+
+        except Exception as exc:
+            if debug:
+                print(f"    [chunk {i}] exception: {exc}")
+
+    return heightmaps, water_maps
 
 
 def diagnose_region(filepath: str, max_chunks: int = 3) -> None:
