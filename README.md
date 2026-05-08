@@ -65,6 +65,13 @@ Number of parallel worker processes for parsing `.mca` region files. Defaults to
 - **Ground-only (recommended):** Uses `MOTION_BLOCKING_NO_LEAVES` — ignores trees, leaves, plants, and man-made structures. Shows the actual terrain surface.
 - **World surface:** Uses `WORLD_SURFACE` — faster, but tree canopies and building roofs contribute to the heightmap.
 
+### Water block detection *(Java only, optional)*
+When enabled, identifies actual water blocks during region parsing. Ocean detection then requires **both**:
+- Altitude ≤ sea level **AND**
+- Block type is water
+
+This prevents land depressions (canyons, trenches) below sea level from being incorrectly marked as ocean. Disabled by default because it adds parsing overhead; only enable if your map has terrain below sea level that should not be marked as ocean.
+
 ### Gaussian blur (anti-aliasing)
 Applied to all outputs before rendering or meshing. Recommended: 1.0–2.0. Higher = smoother, lower = more block detail.
 
@@ -76,18 +83,37 @@ Detects the flat water surface in the heightmap histogram and masks out open-sea
 - **Min island area** — land components smaller than this are absorbed into the ocean mask as noise.
 
 ### Floating block removal *(Java only)*
-Full 3-D connectivity analysis per chunk. Blocks that are not connected (6-directional) to the bottom section of their chunk are discarded — removes floating platforms, isolated mid-air artefacts, and single hanging blocks. Overhangs are safe: they connect to the cliff face through horizontal neighbours. About 2–3× slower per chunk than the default heightmap method.
+Full 3-D connectivity analysis per chunk. Blocks that are not connected (6-directionally) to the bottom section of their chunk are discarded — removes floating platforms, isolated mid-air artefacts, and single hanging blocks. Overhangs are safe: they connect to the cliff face through horizontal neighbours. About 2–3× slower per chunk than the default heightmap method.
+
+**Note:** On custom maps where terrain is not always connected to bedrock (e.g. builder-placed terrain), disable this feature.
+
+### Force scan *(Java only)*
+By default, the parser uses stored heightmap data from the NBT (fast but potentially stale). `force_scan` bypasses stored heightmaps and always scans block sections directly. Slower, but fixes holes caused by outdated chunk data. Automatically disables chunk caching when enabled.
 
 ### Heightmap image
-- **Max width / height (px):** Output image dimensions. The larger side is capped at this value; aspect ratio is preserved. The heightmap is downsampled to the output resolution before processing — memory usage scales with output size, not source map size.
-- **Relief gamma:** Exponent applied to relative altitude before colour mapping. Values < 1.0 stretch low-relief areas for more visible colour variation on flat maps (0.5–0.7 recommended for maps like Westeros). 1.0 = linear.
+- **Max width / height (px):** Output image dimensions. The larger side is capped at this value; aspect ratio is preserved. The heightmap is downsampled to the output resolution before processing — memory usage scales with output size, not source map size. Set to 0 for full native resolution (one pixel per block).
+- **Rectangular crop:** When using a crop polygon, choose whether the output PNG is:
+  - **YES** — rectangular (outside polygon filled with ocean color)
+  - **NO** — transparent RGBA (outside polygon has alpha=0, invisible)
 
 ### STL physical dimensions
 Maximum bounding box for the printed model in mm. Aspect ratio is always preserved — the smaller dimension will be less than its maximum.
 
-- **Max X / Y (mm):** Horizontal bounds.
-- **Max Z (mm):** Altitude relief scale. Independent of XY — use a higher value to exaggerate terrain height.
-- **Base plate thickness (mm):** Solid base below the lowest terrain point.
+- **Max X / Y (mm):** Horizontal bounds in mm. The map is scaled to fit within these dimensions.
+- **Z exaggeration (factor):** Multiplier for vertical relief independent of XY scale. Examples:
+  - `1.0` = physically accurate (same scale as XY) — usually too flat for terrain
+  - `5.0–15.0` = typical for printable terrain models
+  - `0.1` = extreme flattening (great for contour maps)
+- **Base plate thickness (mm):** Solid base below the lowest terrain point. Prevents sharp edges on the bottom of the print.
+- **Border width (layers):** Optional wall around the entire model. Helps prevent resin leakage when using a mold. Model size including border stays within Max X/Y.
+
+### Crop polygon and sea masking
+Both are defined in the unified `config.json` file under `crop_area` and `sea_masking` sections (list of polygon vertices).
+
+- **Crop area:** Quadrilateral region (4 `[x, z]` block coordinates). Only terrain inside this polygon appears in outputs; outside is set to the minimum height.
+- **Sea masking polygons:** One or more polygons that force specific regions to sea level. Useful for defining exact coastlines or masking off unwanted water bodies.
+
+Format: `[[[x1, z1], [x2, z2], ...], ...]` — list of polygons, each polygon is a list of `[x, z]` block coordinates (Minecraft world coordinates).
 
 ### STL mesh resolution
 Maximum number of vertices on the longest side. The heightmap is downsampled to this resolution before meshing. Higher = more detail and larger files.
@@ -171,7 +197,7 @@ requirements.txt
 
 ## Tested worlds
 
-- **WesterosEssos** (Java Edition, ~18k × 18k blocks) — the primary target map
+- **WesterosEssos** (Java Edition, ~16k × 16k blocks) — the primary target map
 - Synthetic 128 × 128 test saves (automated tests)
 - Bedrock Edition support added; tested against Bedrock key format specification
 
@@ -182,3 +208,109 @@ requirements.txt
 - **Bedrock ground-only filtering** is not supported. The `Data2D` record stores only the surface heightmap (equivalent to `WORLD_SURFACE`); ground-only would require scanning all sub-chunk block palettes.
 - **Nether and The End** are not parsed — only the overworld is extracted.
 - Very tall structures (build-limit towers, etc.) will appear as peaks in the heightmap when ground-only filtering is disabled.
+
+---
+
+## Example config.json
+
+```json
+{
+  "configuration": {
+    "_comment_paths": "Minecraft save location and output directory",
+    "save_path": "C:\\Minecraft\\WesterosEssos16k",
+    "out_dir": "C:\\Minecraft\\WesterosEssos16k\\output",
+
+    "_comment_parsing": "Java Edition parsing options",
+    "n_workers": 16,
+    "ground_only": true,
+    "detect_water_blocks": false,
+    "detect_floating": false,
+    "force_scan": true,
+
+    "_comment_ocean": "Ocean detection and water body filtering",
+    "mask_ocean": true,
+    "sea_level": null,
+    "min_ocean_blocks": 500000,
+    "min_land_area": 2000,
+
+    "_comment_image": "Heightmap image generation settings",
+    "generate_heightmap": true,
+    "smooth_sigma": 1.5,
+    "max_px_w": 0,
+    "max_px_h": 0,
+    "rectangular_crop": true,
+
+    "_comment_stl_single": "Single STL physical dimensions and options",
+    "generate_stl": true,
+    "max_x_mm": 260.0,
+    "max_y_mm": 260.0,
+    "z_exaggeration": 0.1,
+    "base_mm": 3.0,
+    "sea_level_offset": 5,
+    "border_width": 4,
+    "max_verts": 1500,
+
+    "_comment_mosaic": "Mosaic tile STL generation",
+    "generate_mosaic": true,
+    "tile_x_mm": 260.0,
+    "tile_y_mm": 260.0,
+    "skip_ocean_stl": false
+  },
+
+  "_comment_crop": "Crop area: 4-point polygon in Minecraft block coordinates",
+  "crop_area": [
+    [-8320, -8448],
+    [8319, -8448],
+    [8319, 8447],
+    [-8320, 8447]
+  ],
+
+  "_comment_masking": "Sea masking polygons: force regions to sea level",
+  "sea_masking": [
+    [
+      [-4566.5, -4400.5],
+      [-3920.5, -5594.5],
+      [-3225.5, -6647.5],
+      [-2389.5, -6743.5],
+      [-1328.5, -7361.5],
+      [97.5, -8447.5],
+      [8318.5, -8445.5],
+      [8319.5, -3366.5],
+      [-3006.5, -3131.5],
+      [-3182.5, -4355.5]
+    ]
+  ]
+}
+```
+
+### Key parameter explanations
+
+**Parsing & Performance:**
+- `n_workers` — Parallel processes. Higher = faster but uses more CPU/memory.
+- `ground_only` — Ignore trees and structures; show terrain only.
+- `detect_water_blocks` — Prevent land depressions below sea level from being marked ocean (opt-in, slower).
+- `detect_floating` — Remove floating block artefacts via 3D connectivity (slower; disable for builder-placed terrain).
+- `force_scan` — Bypass potentially stale NBT heightmaps; always scan sections (slower but fixes holes).
+
+**Ocean Detection:**
+- `mask_ocean` — Flatten open sea for better coastline detail.
+- `sea_level` — Y coordinate; auto-detected if `null`.
+- `min_ocean_blocks` — Water bodies < this size become lakes/rivers.
+- `min_land_area` — Land areas < this size become noise/ocean.
+
+**Image Output:**
+- `smooth_sigma` — Gaussian blur (0 = sharp, 1.5-2.0 = recommended, higher = blurrier).
+- `max_px_w/h` — Output image size; 0 = native (1 pixel per block).
+- `rectangular_crop` — TRUE = rectangular PNG; FALSE = transparent outside crop polygon.
+
+**STL Physical Scale:**
+- `max_x_mm` / `max_y_mm` — Horizontal bounds (aspect ratio preserved).
+- `z_exaggeration` — Vertical relief multiplier (1.0 = accurate, 5-15 = typical prints).
+- `sea_level_offset` — Expose seafloor by pretending sea is lower (0 = actual sea level).
+- `base_mm` — Solid base thickness.
+- `border_width` — Wall perimeter for molds (0 = none).
+- `max_verts` — Mesh detail (500-2000 typical).
+
+**Mosaic Tiles:**
+- `tile_x_mm` / `tile_y_mm` — Tile dimensions (typically print bed size).
+- `skip_ocean_stl` — Don't generate 100%-ocean tiles (saves filament).
