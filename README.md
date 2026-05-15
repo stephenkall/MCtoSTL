@@ -218,7 +218,7 @@ requirements.txt
 
 ## Tested worlds
 
-- **WesterosEssos** (Java Edition, ~16k × 16k blocks) — the primary target map
+- [**WesterosEssos**](https://www.planetminecraft.com/project/entire-known-world-of-a-song-of-fire-and-ice-westeros-essos-multiple-sizes/) *(credits to [Cannon Man](https://www.planetminecraft.com/member/cannon_man/))* (Java Edition, ~16k × 16k blocks) — the primary target map
 - Synthetic 128 × 128 test saves (automated tests)
 - Bedrock Edition support added; tested against Bedrock key format specification
 
