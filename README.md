@@ -11,8 +11,24 @@ Supports **Java Edition** (`.mca` Anvil files) and **Bedrock Edition** (LevelDB 
 | File | Description |
 |------|-------------|
 | `heightmap.png` | Color-coded relief image: red = highest, green = sea level, blue = below sea, steel-blue = open ocean |
+| `heightmap_gray.png` | Monochromatic relief image: white = highest, black = sea level, dark-gray = below sea |
 | `terrain.stl` | Single watertight solid of the entire terrain |
 | `tiles/tile_ZZZ_XXX.stl` | Mosaic pack of printable tiles that fit your print bed |
+
+Examples:
+heightmap.png
+<img width="3328" height="3379" alt="heightmap" src="https://github.com/user-attachments/assets/a045f16b-902d-4122-891f-0fa3027be473" />
+
+heightmap_gray.png
+<img width="16640" height="16896" alt="heightmap_gray" src="https://github.com/user-attachments/assets/350ca55e-ec1b-4559-a843-ffb0426656d9" />
+
+terrain.stl
+<img width="1306" height="819" alt="terrain" src="https://github.com/user-attachments/assets/27dfc18a-2778-4052-93b4-a6f3c2d473c5" />
+
+3D-Printed STL
+<img width="1600" height="1108" alt="image" src="https://github.com/user-attachments/assets/d126e61c-3437-4b70-878a-3a04e7b417b3" />
+<img width="1600" height="1200" alt="image" src="https://github.com/user-attachments/assets/82928f2b-3d96-43a3-9364-6cfdd95d2031" />
+<img width="1600" height="1200" alt="image" src="https://github.com/user-attachments/assets/2c87a1c3-477d-44e2-acbb-510faa611fb7" />
 
 ---
 
