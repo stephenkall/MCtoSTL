@@ -16,6 +16,11 @@ Supports **Java Edition** (`.mca` Anvil files) and **Bedrock Edition** (LevelDB 
 | `tiles/tile_ZZZ_XXX.stl` | Mosaic pack of printable tiles that fit your print bed |
 
 Examples:
+Original Minecraft view:
+<img width="1916" height="1005" alt="image" src="https://github.com/user-attachments/assets/c674c558-abe2-4096-87fe-d417c050cff9" />
+<img width="1037" height="860" alt="image" src="https://github.com/user-attachments/assets/420f35d2-8db1-40a5-b111-0490d947e9ba" />
+<img width="1810" height="894" alt="image" src="https://github.com/user-attachments/assets/b3456c25-1e18-4000-b636-afedcd4a2759" />
+
 heightmap.png
 <img width="3328" height="3379" alt="heightmap" src="https://github.com/user-attachments/assets/a045f16b-902d-4122-891f-0fa3027be473" />
 
@@ -29,11 +34,6 @@ terrain.stl
 <img width="1600" height="1108" alt="image" src="https://github.com/user-attachments/assets/d126e61c-3437-4b70-878a-3a04e7b417b3" />
 <img width="1600" height="1200" alt="image" src="https://github.com/user-attachments/assets/82928f2b-3d96-43a3-9364-6cfdd95d2031" />
 <img width="1600" height="1200" alt="image" src="https://github.com/user-attachments/assets/2c87a1c3-477d-44e2-acbb-510faa611fb7" />
-
-Original Minecraft view:
-<img width="1916" height="1005" alt="image" src="https://github.com/user-attachments/assets/c674c558-abe2-4096-87fe-d417c050cff9" />
-<img width="1037" height="860" alt="image" src="https://github.com/user-attachments/assets/420f35d2-8db1-40a5-b111-0490d947e9ba" />
-<img width="1810" height="894" alt="image" src="https://github.com/user-attachments/assets/b3456c25-1e18-4000-b636-afedcd4a2759" />
 
 ---
 
